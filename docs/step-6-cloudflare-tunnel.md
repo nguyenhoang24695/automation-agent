@@ -1,4 +1,4 @@
-# Step 6: Add Cloudflare Tunnel
+# Step 6: Add Cloudflare Tunnel (Node.js Worker)
 
 ## Mục tiêu
 
@@ -11,172 +11,189 @@ Expose local web apps (Next.js, React, etc.) ra internet qua Cloudflare Tunnel �
 ```text
 Web App (localhost:3000)
     ↓
-cloudflared tunnel
+cloudflared tunnel (spawned by Worker)
     ↓
 *.trycloudflare.com (public URL)
     ↓
-Bot sends URL to Telegram
+Worker sends URL to Telegram
 ```
 
 ---
 
 ## 1. Cài đặt cloudflared
 
-### Trên host Ubuntu:
-
-```bash
-# Cài cloudflared
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-sudo mv cloudflared /usr/local/bin/
-sudo chmod +x /usr/local/bin/cloudflared
-
-# Verify
-cloudflared --version
-```
+cloudflared is installed inside the Worker container (see Dockerfile in Section 7).
 
 ---
 
 ## 2. Tunnel Helper
 
-Tạo file **workers/tunnel_helper.py:**
+Tạo file **workers/src/tunnel-helper.js:**
 
-```python
-import subprocess
-import re
-import asyncio
+```javascript
+import { spawn } from 'node:child_process';
 
+/**
+ * Manages Cloudflare Tunnels to expose local ports.
+ */
+export class TunnelHelper {
+  constructor() {
+    /** @type {Map<string, import('child_process').ChildProcess>} */
+    this.processes = new Map();
+  }
 
-class TunnelHelper:
-    """Quản lý Cloudflare Tunnel để expose local ports."""
+  /**
+   * Start a tunnel for the given port.
+   * @param {string} sessionId
+   * @param {number} localPort
+   * @returns {Promise<string|null>} - Public URL or null
+   */
+  async startTunnel(sessionId, localPort) {
+    try {
+      const proc = spawn('cloudflared', [
+        'tunnel',
+        '--url', `http://localhost:${localPort}`,
+        '--no-autoupdate',
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
 
-    def __init__(self):
-        self.processes: dict[str, subprocess.Popen] = {}
+      this.processes.set(sessionId, proc);
 
-    async def start_tunnel(self, session_id: str, local_port: int) -> str | None:
-        """Khởi tạo tunnel cho port, trả về public URL."""
-        try:
-            process = subprocess.Popen(
-                [
-                    "cloudflared", "tunnel",
-                    "--url", f"http://localhost:{local_port}",
-                    "--no-autoupdate",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+      // Extract URL from stderr (cloudflared writes URL to stderr)
+      const url = await this.extractUrl(proc, 30);
+      return url;
 
-            self.processes[session_id] = process
+    } catch (err) {
+      console.error(`❌ Tunnel error: ${err.message}`);
+      return null;
+    }
+  }
 
-            # Đọc stderr để lấy URL (cloudflared ghi URL vào stderr)
-            url = await self._extract_url(process)
-            return url
+  /**
+   * Read cloudflared stderr to extract the tunnel URL.
+   * @param {import('child_process').ChildProcess} proc
+   * @param {number} timeoutSec
+   * @returns {Promise<string|null>}
+   */
+  extractUrl(proc, timeoutSec = 30) {
+    const urlPattern = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 
-        except Exception as e:
-            print(f"❌ Tunnel error: {e}")
-            return None
+    return new Promise((resolve) => {
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (!resolved) { resolved = true; resolve(null); }
+      }, timeoutSec * 1000);
 
-    async def _extract_url(self, process: subprocess.Popen, timeout: int = 30) -> str | None:
-        """Đọc URL từ cloudflared output."""
-        url_pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+      proc.stderr.on('data', (chunk) => {
+        const line = chunk.toString();
+        const match = urlPattern.exec(line);
+        if (match && !resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve(match[0]);
+        }
+      });
 
-        for _ in range(timeout):
-            line = process.stderr.readline()
-            if not line:
-                await asyncio.sleep(1)
-                continue
-            match = url_pattern.search(line)
-            if match:
-                return match.group(0)
+      proc.on('exit', () => {
+        if (!resolved) { resolved = true; clearTimeout(timer); resolve(null); }
+      });
+    });
+  }
 
-        return None
+  /**
+   * Stop a tunnel by session ID.
+   */
+  stopTunnel(sessionId) {
+    const proc = this.processes.get(sessionId);
+    if (proc) {
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 5000);
+      this.processes.delete(sessionId);
+      console.log(`🛑 Tunnel stopped: ${sessionId}`);
+    }
+  }
 
-    def stop_tunnel(self, session_id: str):
-        """Dừng tunnel."""
-        process = self.processes.pop(session_id, None)
-        if process:
-            process.terminate()
-            process.wait(timeout=5)
-            print(f"🛑 Tunnel stopped: {session_id}")
-
-    def stop_all(self):
-        """Dừng tất cả tunnels."""
-        for sid in list(self.processes.keys()):
-            self.stop_tunnel(sid)
+  /**
+   * Stop all active tunnels.
+   */
+  stopAll() {
+    for (const [sid] of this.processes) {
+      this.stopTunnel(sid);
+    }
+  }
+}
 ```
 
 ---
 
 ## 3. Tích hợp vào Worker
 
-Thêm vào **workers/worker.py** — auto-detect port và tạo tunnel:
+Update **workers/src/worker.js** — auto-detect web app port and create tunnel:
 
-```python
-from tunnel_helper import TunnelHelper
+```javascript
+import { TunnelHelper } from './tunnel-helper.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
-tunnel_helper = TunnelHelper()
+const tunnelHelper = new TunnelHelper();
 
-# Thêm vào config.py
-TUNNEL_ENABLED = os.getenv("TUNNEL_ENABLED", "true").lower() == "true"
-DEFAULT_APP_PORT = int(os.getenv("DEFAULT_APP_PORT", "3000"))
+// Add to config.js:
+// tunnelEnabled: process.env.TUNNEL_ENABLED === 'true',
+// defaultAppPort: parseInt(process.env.DEFAULT_APP_PORT || '3000', 10),
 
+/**
+ * Detect if a web app exists in the workspace.
+ * @param {string} workspacePath
+ * @param {number} defaultPort
+ * @returns {number|null}
+ */
+function detectWebAppPort(workspacePath, defaultPort) {
+  // Check for package.json (likely a Node.js app)
+  if (fs.existsSync(path.join(workspacePath, 'package.json'))) {
+    return defaultPort;
+  }
 
-async def execute_task(session_id: str, task: str, chat_id: int):
+  // Check common framework config files
+  const portFiles = [
+    { file: 'vite.config.*', port: 5173 },
+    { file: 'next.config.*', port: 3000 },
+    { file: 'angular.json', port: 4200 },
+  ];
 
-    try:
-        # Sau khi OpenHands chạy xong, kiểm tra xem có web app không
-        if status == "done" and TUNNEL_ENABLED:
-            port = await detect_web_app_port(workspace_path, DEFAULT_APP_PORT)
-            if port:
-                await send_status(chat_id, session_id, "🌐 Starting tunnel...")
+  for (const { file, port } of portFiles) {
+    if (fs.existsSync(path.join(workspacePath, file))) {
+      return port;
+    }
+  }
 
-                url = await tunnel_helper.start_tunnel(session_id, port)
-                if url:
-                    collector.add(f"🌐 Preview URL: {url}")
-                    await send_message(chat_id, f"🌐 **Preview URL**: {url}")
+  return null;
+}
 
-                    # Auto-stop sau 30 phút
-                    asyncio.create_task(auto_stop_tunnel(session_id, 1800))
+/**
+ * Auto-stop a tunnel after a delay.
+ */
+function autoStopTunnel(sessionId, delayMs = 1800000) { // 30 minutes
+  setTimeout(() => tunnelHelper.stopTunnel(sessionId), delayMs);
+}
 
-    except Exception as e:
-        collector.add(f"Tunnel error: {e}")
-
-
-async def detect_web_app_port(workspace_path: str, default_port: int) -> int | None:
-    """Kiểm tra workspace có web app đang chạy không."""
-    import subprocess
-
-    # Kiểm tra package.json → có thể là Node.js app
-    import os
-    pkg_json = os.path.join(workspace_path, "package.json")
-    if os.path.exists(pkg_json):
-        return default_port
-
-    # Kiểm tra các port phổ biến
-    for port in [3000, 8080, 5173, 4200]:
-        try:
-            result = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                 f"http://localhost:{port}"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if result.stdout.startswith(("2", "3")):
-                return port
-        except Exception:
-            continue
-
-    return None
-
-
-async def auto_stop_tunnel(session_id: str, delay: int):
-    """Tự động dừng tunnel sau N giây."""
-    await asyncio.sleep(delay)
-    tunnel_helper.stop_tunnel(session_id)
+// After OpenHands task completes, check for web app:
+// if (execResult.status === 'done' && config.tunnelEnabled) {
+//   const port = detectWebAppPort(workspacePath, config.defaultAppPort);
+//   if (port && chat_id) {
+//     await sendStatus(chat_id, session_id, '🌐 Starting tunnel...');
+//     const url = await tunnelHelper.startTunnel(session_id, port);
+//     if (url) {
+//       await sendTelegramMessage(chat_id, `🌐 *Preview URL*: ${url}`);
+//       autoStopTunnel(session_id);
+//     }
+//   }
+// }
 ```
 
 ---
 
-## 4. Bot Command — Tunnel Control (Node.js)
+## 4. Bot Command — Tunnel Control (Gateway — Node.js)
 
 Thêm vào **gateway/src/bot/telegram.js:**
 
@@ -210,46 +227,59 @@ bot.command('tunnel', async (ctx) => {
 });
 ```
 
-> **Lưu ý**: Gateway (Node.js) nhận command và đẩy task vào Redis.
-> Worker (Python) xử lý tunnel lifecycle qua `tunnel_helper.py`.
-
 ---
 
-## 5. Worker — Xử lý Tunnel Commands
+## 5. Worker — Xử lý Tunnel Commands (Node.js)
 
-Thêm vào **workers/worker.py:**
+Add to **workers/src/worker.js** — handle `[TUNNEL_*]` tasks:
 
-```python
-# Trong execute_task(), thêm xử lý tunnel commands:
+```javascript
+// In executeTask(), add tunnel handling:
 
-elif task.startswith("[TUNNEL_START]"):
-    port_str = task.split("port=")[-1].strip()
-    port = int(port_str)
-    url = await tunnel_helper.start_tunnel(session_id, port)
-    if url:
-        collector.add(f"🌐 Tunnel URL: {url}")
-        status = "done"
-    else:
-        collector.add("❌ Failed to start tunnel")
-        status = "error"
+if (task.startsWith('[TUNNEL_START]')) {
+  const portStr = task.split('port=')[1]?.trim();
+  const port = parseInt(portStr) || config.defaultAppPort;
+  const url = await tunnelHelper.startTunnel(session_id, port);
+  if (url) {
+    return { status: 'done', logs: `🌐 Tunnel URL: ${url}`, exitCode: 0 };
+  }
+  return { status: 'error', logs: '❌ Failed to start tunnel', exitCode: 1 };
+}
 
-elif task == "[TUNNEL_STOP]":
-    tunnel_helper.stop_tunnel(session_id)
-    collector.add("🛑 Tunnel stopped")
-    status = "done"
+if (task === '[TUNNEL_STOP]') {
+  tunnelHelper.stopTunnel(session_id);
+  return { status: 'done', logs: '🛑 Tunnel stopped', exitCode: 0 };
+}
 ```
 
 ---
 
-## 6. Docker: Cài cloudflared trong Worker
+## 6. Docker: Install cloudflared in Worker
 
-Thêm vào **workers/Dockerfile:**
+Update **workers/Dockerfile:**
 
 ```dockerfile
-# Install cloudflared
-RUN curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install git and cloudflared
+RUN apk add --no-cache git openssh-client curl
+
+# Install cloudflared (ARM64 compatible)
+ARG TARGETARCH
+RUN curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${TARGETARCH:-arm64} \
     -o /usr/local/bin/cloudflared \
     && chmod +x /usr/local/bin/cloudflared
+
+# Install dependencies
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev
+
+# Copy source
+COPY src/ ./src/
+
+CMD ["node", "src/index.js"]
 ```
 
 ---
@@ -312,11 +342,11 @@ docker compose up --build -d
 
 ## Kết quả Step 6
 
-- [x] cloudflared cài đặt trong worker container
+- [x] cloudflared installed in Node.js worker container
 - [x] Auto-detect web app port
-- [x] Quick tunnel tạo URL public
-- [x] URL gửi về Telegram tự động
-- [x] Auto-stop sau 30 phút
+- [x] Quick tunnel creates public URL (trycloudflare.com)
+- [x] URL sent to Telegram automatically
+- [x] Auto-stop after 30 minutes
 - [x] Bot commands: `/tunnel start`, `/tunnel stop`
 
 ---
@@ -324,9 +354,9 @@ docker compose up --build -d
 ## Hoàn thành Phase 1 MVP!
 
 ```text
-✅ Telegram commands
+✅ Telegram commands (Node.js Gateway)
 ✅ Single user (whitelist)
-✅ OpenHands worker
+✅ OpenHands worker (Node.js + dockerode)
 ✅ Coding task execution
 ✅ Logs streamed to Telegram
 ✅ Docker sandbox isolation

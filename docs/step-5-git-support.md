@@ -1,4 +1,4 @@
-# Step 5: Add Git Support
+# Step 5: Add Git Support (Node.js Worker)
 
 ## Mục tiêu
 
@@ -11,13 +11,13 @@ Cho phép OpenHands worker clone, làm việc và commit với Git repositories.
 ```text
 User sends: "Clone repo X and run it"
     ↓
-Gateway parses Git command
+Gateway parses Git command → Redis queue
     ↓
-Worker clones repo vào workspace
+Worker detects [GIT_*] prefix
     ↓
-OpenHands works on code
+Git operations via child_process
     ↓
-Auto-commit & push (optional)
+Results sent to Telegram
 ```
 
 ---
@@ -35,91 +35,84 @@ Auto-commit & push (optional)
 
 ## 2. Git Helper
 
-Tạo file **workers/git_helper.py:**
+Tạo file **workers/src/git-helper.js:**
 
-```python
-import subprocess
-import os
-from pathlib import Path
+```javascript
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import path from 'node:path';
 
+const execFileAsync = promisify(execFile);
 
-class GitHelper:
-    """Quản lý Git operations trong workspace."""
+/**
+ * Manages Git operations in a workspace directory.
+ */
+export class GitHelper {
+  /**
+   * @param {string} workspacePath - Absolute path to workspace
+   */
+  constructor(workspacePath) {
+    this.workspace = workspacePath;
+  }
 
-    def __init__(self, workspace_path: str):
-        self.workspace = Path(workspace_path)
+  /**
+   * Run a git command in the workspace.
+   * @param {string[]} args
+   * @param {number} [timeout=120000] - Timeout in ms
+   */
+  async run(args, timeout = 120000) {
+    const { stdout, stderr } = await execFileAsync('git', args, {
+      cwd: this.workspace,
+      timeout,
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+    });
+    return stdout.trim();
+  }
 
-    def clone(self, repo_url: str) -> str:
-        """Clone repo vào workspace."""
-        result = subprocess.run(
-            ["git", "clone", repo_url, "."],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Clone failed: {result.stderr}")
-        return f"✅ Cloned: {repo_url}"
+  async clone(repoUrl) {
+    await this.run(['clone', repoUrl, '.'], 120000);
+    return `✅ Cloned: ${repoUrl}`;
+  }
 
-    def pull(self) -> str:
-        """Pull latest changes."""
-        result = subprocess.run(
-            ["git", "pull"],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Pull failed: {result.stderr}")
-        return f"✅ Pulled latest changes"
+  async pull() {
+    await this.run(['pull'], 60000);
+    return '✅ Pulled latest changes';
+  }
 
-    def status(self) -> str:
-        """Hiển thị git status."""
-        result = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout or "No changes"
+  async status() {
+    const output = await this.run(['status', '--short']);
+    return output || 'No changes';
+  }
 
-    def commit(self, message: str) -> str:
-        """Commit all changes."""
-        subprocess.run(["git", "add", "-A"], cwd=self.workspace, check=True)
-        result = subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return "⚠️ Nothing to commit"
-        return f"✅ Committed: {message}"
+  async commit(message) {
+    await this.run(['add', '-A']);
+    try {
+      const output = await this.run(['commit', '-m', message]);
+      return `✅ Committed: ${message}`;
+    } catch {
+      return '⚠️ Nothing to commit';
+    }
+  }
 
-    def push(self) -> str:
-        """Push lên remote."""
-        result = subprocess.run(
-            ["git", "push"],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Push failed: {result.stderr}")
-        return "✅ Pushed to remote"
+  async push() {
+    await this.run(['push'], 60000);
+    return '✅ Pushed to remote';
+  }
 
-    def log(self, n: int = 5) -> str:
-        """Hiển thị n commits gần nhất."""
-        result = subprocess.run(
-            ["git", "log", f"-{n}", "--oneline"],
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout or "No commits yet"
+  async log(n = 5) {
+    const output = await this.run(['log', `-${n}`, '--oneline']);
+    return output || 'No commits yet';
+  }
+
+  /**
+   * Validate a repository URL for safety.
+   */
+  static validateUrl(url) {
+    if (!url.startsWith('https://') && !url.startsWith('git@')) return false;
+    if (url.includes('..')) return false;
+    return true;
+  }
+}
 ```
 
 ---
@@ -155,9 +148,11 @@ Cập nhật **docker-compose.yml** — thêm volume cho worker:
       - ./secrets/git_ssh_key:/root/.ssh/id_ed25519:ro  # ← Git SSH key
 ```
 
+> **Note:** Also need to install `git` in the worker Dockerfile (see Section 7).
+
 ---
 
-## 4. Bot Commands — Git Handlers (Node.js)
+## 4. Bot Commands — Git Handlers (Gateway — Node.js)
 
 Thêm vào **gateway/src/bot/telegram.js:**
 
@@ -220,84 +215,98 @@ bot.command('push', async (ctx) => {
 });
 ```
 
-> **Lưu ý**: Gateway (Node.js) parse commands và đẩy task vào Redis queue.
-> Worker (Python) nhận task từ queue và thực thi Git operations.
-
 ---
 
-## 5. Worker — Xử lý Git Tasks
+## 5. Worker — Xử lý Git Tasks (Node.js)
 
-Thêm vào **workers/worker.py** — xử lý prefix `[GIT_*]`:
+Update **workers/src/worker.js** — handle `[GIT_*]` prefixed tasks:
 
-```python
-from git_helper import GitHelper
+```javascript
+import { GitHelper } from './git-helper.js';
 
-async def execute_task(session_id: str, task: str, chat_id: int):
-    """Thực thi task, hỗ trợ cả Git commands."""
-    import os
-    workspace_path = f"{WORKSPACE_BASE}/{session_id}"
-    os.makedirs(workspace_path, exist_ok=True)
+// In the executeTask function, add Git handling before OpenHands:
 
-    collector = LogCollector(session_id)
-    git = GitHelper(workspace_path)
+export async function executeTask(taskData) {
+  const { session_id, task, chat_id } = taskData;
+  const workspacePath = path.join(config.workspaceBase, session_id);
 
-    await send_status(chat_id, session_id, "running")
+  fs.mkdirSync(workspacePath, { recursive: true });
+  const git = new GitHelper(workspacePath);
 
-    try:
-        # Git commands
-        if task.startswith("[GIT_CLONE]"):
-            repo_url = task.replace("[GIT_CLONE]", "").strip()
-            result = git.clone(repo_url)
-            collector.add(result)
-            status = "done"
+  // Git commands (no OpenHands needed)
+  if (task.startsWith('[GIT_CLONE]')) {
+    const repoUrl = task.replace('[GIT_CLONE]', '').trim();
+    if (!GitHelper.validateUrl(repoUrl)) {
+      return { status: 'error', logs: '❌ Invalid repository URL', exitCode: -1 };
+    }
+    try {
+      const result = await git.clone(repoUrl);
+      return { status: 'done', logs: result, exitCode: 0 };
+    } catch (err) {
+      return { status: 'error', logs: `❌ Clone failed: ${err.message}`, exitCode: 1 };
+    }
+  }
 
-        elif task.startswith("[GIT_COMMIT]"):
-            msg = task.replace("[GIT_COMMIT]", "").strip()
-            result = git.commit(msg)
-            collector.add(result)
-            status = "done"
+  if (task.startsWith('[GIT_COMMIT]')) {
+    const msg = task.replace('[GIT_COMMIT]', '').trim();
+    const result = await git.commit(msg);
+    return { status: 'done', logs: result, exitCode: 0 };
+  }
 
-        elif task == "[GIT_PUSH]":
-            result = git.push()
-            collector.add(result)
-            status = "done"
+  if (task === '[GIT_PUSH]') {
+    try {
+      const result = await git.push();
+      return { status: 'done', logs: result, exitCode: 0 };
+    } catch (err) {
+      return { status: 'error', logs: `❌ Push failed: ${err.message}`, exitCode: 1 };
+    }
+  }
 
-        # Normal task → OpenHands
-        else:
-            collector.add(f"Task: {task}")
-            # ... existing OpenHands container logic ...
-            status = "done"
-
-    except Exception as e:
-        collector.add(f"Error: {e}")
-        status = "error"
-
-    summary = collector.get_summary(status)
-    await send_message(chat_id, summary)
+  // Normal task → OpenHands (existing logic from Step 3/4)
+  // ... OpenHands container spawn ...
+}
 ```
 
 ---
 
 ## 6. Security: Git Safety Rules
 
-```python
-# Thêm vào workers/git_helper.py
+```javascript
+// In workers/src/git-helper.js
 
-BLOCKED_DOMAINS = []  # Có thể thêm domain bị chặn
-MAX_REPO_SIZE_MB = 500  # Giới hạn repo size
+const BLOCKED_DOMAINS = []; // Add domains to block
+const MAX_REPO_SIZE_MB = 500;
 
-def validate_repo_url(url: str) -> bool:
-    """Kiểm tra URL hợp lệ."""
-    if not url.startswith(("https://", "git@")):
-        return False
-    if ".." in url:
-        return False
-    return True
+// validateUrl() is already implemented as a static method in GitHelper class
 ```
 
 ---
 
-## 7. Build & Run
+## 7. Worker Dockerfile — Install Git
+
+Add `git` to the worker Dockerfile:
+
+```dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install git for Git operations
+RUN apk add --no-cache git openssh-client
+
+# Install dependencies
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev
+
+# Copy source
+COPY src/ ./src/
+
+CMD ["node", "src/index.js"]
+```
+
+---
+
+## 8. Build & Run
 
 ```bash
 cd /opt/ai-agent
@@ -306,7 +315,7 @@ docker compose up --build -d
 
 ---
 
-## 8. Kiểm tra
+## 9. Kiểm tra
 
 ```text
 1. /clone https://github.com/user/repo → Bot: 📦 Cloning...
@@ -322,7 +331,8 @@ docker compose up --build -d
 - [x] Clone repo từ GitHub/GitLab
 - [x] Commit và push changes
 - [x] SSH key cho private repos
-- [x] Bot commands: `/clone`, `/commit`, `/push`
+- [x] Bot commands: `/clone`, `/commit`, `/push` (Node.js Gateway)
+- [x] Git operations via Node.js child_process (dockerode Worker)
 - [x] URL validation và repo size limit
 
 ---

@@ -85,9 +85,10 @@ No need yet:
 
 ## Worker
 
-* Python 3.11
-* Docker SDK
-* Redis
+* Node.js 20
+* dockerode (Docker API)
+* ioredis
+* Cloudflared
 
 ## AI
 
@@ -152,8 +153,8 @@ Allow only approved Telegram user IDs.
 
 Example:
 
-```python
-ALLOWED_USERS = [123456789]
+```javascript
+const ALLOWED_USERS = [123456789];
 ```
 
 ---

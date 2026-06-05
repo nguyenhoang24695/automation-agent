@@ -1,4 +1,4 @@
-# Step 4: Stream Logs to Telegram
+# Step 4: Stream Logs to Telegram (Node.js Worker)
 
 ## Mục tiêu
 
@@ -13,7 +13,7 @@ OpenHands Container
     ↓ (execute task)
 Worker captures logs
     ↓ (format message)
-Bot sends to Telegram
+Worker calls Telegram Bot API
     ↓ (chunked messages)
 User receives update
 ```
@@ -22,253 +22,291 @@ User receives update
 
 ## 1. Log Collector
 
-Tạo file **workers/log_collector.py:**
-
-```python
-import asyncio
-from datetime import datetime
-
-
-class LogCollector:
-    """Thu thập và format logs từ container."""
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.logs: list[str] = []
-        self.start_time = datetime.utcnow()
-
-    def add(self, line: str):
-        timestamp = datetime.utcnow().strftime("%H:%M:%S")
-        entry = f"[{timestamp}] {line}"
-        self.logs.append(entry)
-
-    def get_summary(self, status: str) -> str:
-        """Tạo summary message gửi về Telegram."""
-        duration = (datetime.utcnow() - self.start_time).total_seconds()
-
-        header = (
-            f"{'✅' if status == 'done' else '❌'} **Task {status.upper()}**\n"
-            f"Session: `{self.session_id}`\n"
-            f"Duration: {duration:.1f}s\n"
-            f"{'─' * 30}\n"
-        )
-
-        # Giới hạn 3000 ký tự (Telegram limit = 4096)
-        log_text = "\n".join(self.logs[-50:])  # 50 dòng cuối
-        if len(log_text) > 3000:
-            log_text = "...(truncated)...\n" + log_text[-3000:]
-
-        return header + f"```\n{log_text}\n```"
-```
-
----
-
-## 2. Telegram Notifier
-
-Tạo file **workers/notifier.py:**
-
-```python
-import httpx
-from config import TELEGRAM_BOT_TOKEN
-
-BOT_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-MAX_MSG_LENGTH = 4000
-
-
-async def send_message(chat_id: int, text: str):
-    """Gửi tin nhắn Telegram, tự động chia nhỏ nếu quá dài."""
-    chunks = [text[i:i + MAX_MSG_LENGTH] for i in range(0, len(text), MAX_MSG_LENGTH)]
-
-    async with httpx.AsyncClient() as client:
-        for chunk in chunks:
-            await client.post(
-                f"{BOT_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "parse_mode": "Markdown",
-                },
-                timeout=10,
-            )
-
-
-async def send_status(chat_id: int, session_id: str, status: str):
-    """Gửi status update ngắn."""
-    icons = {"queued": "📋", "running": "🔄", "done": "✅", "error": "❌"}
-    icon = icons.get(status, "❓")
-    msg = f"{icon} Session `{session_id}`: {status}"
-
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{BOT_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": msg,
-                "parse_mode": "Markdown",
-            },
-            timeout=10,
-        )
-```
-
----
-
-## 3. Cập nhật Worker Config
-
-Thêm vào **workers/config.py:**
-
-```python
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-```
-
----
-
-## 4. Cập nhật Worker
-
-Sửa **workers/worker.py** — tích hợp log collector và notifier:
-
-```python
-import asyncio
-import json
-import docker
-import redis.asyncio as aioredis
-from config import REDIS_URL
-from log_collector import LogCollector
-from notifier import send_message, send_status
-
-redis_client = aioredis.from_url(REDIS_URL)
-docker_client = docker.from_env()
-
-TASK_QUEUE = "task_queue"
-OPENHANDS_IMAGE = "docker.all-hands.dev/all-hands-ai/openhands:latest"
-WORKSPACE_BASE = "/opt/ai-agent/workspaces"
-
-
-async def run_worker():
-    """Vòng lặp chính: lấy task và thực thi."""
-    print("🔄 Worker started, waiting for tasks...")
-
-    while True:
-        result = await redis_client.blpop(TASK_QUEUE, timeout=5)
-        if not result:
-            continue
-
-        _, raw = result
-        task_data = json.loads(raw)
-        session_id = task_data["session_id"]
-        task_text = task_data["task"]
-        chat_id = task_data["chat_id"]  # ← thêm từ gateway
-
-        await execute_task(session_id, task_text, chat_id)
-
-
-async def execute_task(session_id: str, task: str, chat_id: int):
-    """Thực thi task và stream logs về Telegram."""
-    import os
-    workspace_path = f"{WORKSPACE_BASE}/{session_id}"
-    os.makedirs(workspace_path, exist_ok=True)
-
-    collector = LogCollector(session_id)
-
-    # Notify: started
-    await send_status(chat_id, session_id, "running")
-    collector.add(f"Task: {task}")
-
-    try:
-        container = docker_client.containers.run(
-            image=OPENHANDS_IMAGE,
-            name=f"openhands-{session_id}",
-            detach=True,
-            environment={"SANDBOX_RUNTIME_CONTAINER_IMAGE": OPENHANDS_IMAGE},
-            volumes={workspace_path: {"bind": "/workspace", "mode": "rw"}},
-            network_mode="bridge",
-            mem_limit="2g",
-            cpu_quota=100000,
-        )
-
-        collector.add(f"Container: {container.short_id}")
-
-        # Stream logs real-time
-        for line in container.logs(stream=True, follow=True):
-            decoded = line.decode("utf-8", errors="replace").strip()
-            if decoded:
-                collector.add(decoded)
-
-        # Wait for completion
-        result = container.wait(timeout=600)
-        status = "done" if result.get("StatusCode") == 0 else "error"
-
-    except Exception as e:
-        collector.add(f"Error: {e}")
-        status = "error"
-
-    # Notify: completed with logs
-    summary = collector.get_summary(status)
-    await send_message(chat_id, summary)
-    print(f"{'✅' if status == 'done' else '❌'} Task {session_id}: {status}")
-
-
-if __name__ == "__main__":
-    asyncio.run(run_worker())
-```
-
----
-
-## 5. Cập nhật Gateway (Node.js) — Truyền chat_id
-
-Sửa **gateway/src/bot/telegram.js** — thêm `chat_id` vào task payload:
+Tạo file **workers/src/log-collector.js:**
 
 ```javascript
-// Handle all messages
-bot.on('text', async (ctx) => {
-  if (!isAllowed(ctx.from.id)) {
-    return ctx.reply('⛔ Access denied.');
+/**
+ * Collects and formats logs from a container execution.
+ */
+export class LogCollector {
+  constructor(sessionId) {
+    this.sessionId = sessionId;
+    this.logs = [];
+    this.startTime = Date.now();
   }
 
-  const taskText = ctx.message.text;
-  const sessionId = `session_${ctx.from.id}_${ctx.message.message_id}`;
+  add(line) {
+    const timestamp = new Date().toISOString().slice(11, 19); // HH:MM:SS
+    this.logs.push(`[${timestamp}] ${line}`);
+  }
 
-  await enqueueTask(sessionId, taskText, ctx.chat.id); // ← chat_id truyền cho worker
-  await ctx.reply(`📋 Task queued!\nSession: \`${sessionId}\``, {
-    parse_mode: 'Markdown',
-  });
-});
-```
+  /**
+   * Generate a Telegram-friendly summary message.
+   * @param {string} status - 'done' or 'error'
+   * @returns {string}
+   */
+  getSummary(status) {
+    const duration = ((Date.now() - this.startTime) / 1000).toFixed(1);
+    const icon = status === 'done' ? '✅' : '❌';
 
-Sửa **gateway/src/queue/redis.js** — đảm bảo `enqueueTask` nhận `chatId`:
+    const header = [
+      `${icon} *Task ${status.toUpperCase()}*`,
+      `Session: \`${this.sessionId}\``,
+      `Duration: ${duration}s`,
+      '─'.repeat(30),
+    ].join('\n');
 
-```javascript
-export async function enqueueTask(sessionId, task, chatId) {
-  const payload = JSON.stringify({
-    session_id: sessionId,
-    task,
-    chat_id: chatId, // ← truyền chat_id cho worker
-  });
-  await redis.rpush(TASK_QUEUE, payload);
+    // Last 50 lines, max 3000 chars (Telegram limit = 4096)
+    const recentLogs = this.logs.slice(-50).join('\n');
+    let logText = recentLogs.length > 3000
+      ? '...(truncated)...\n' + recentLogs.slice(-3000)
+      : recentLogs;
+
+    return `${header}\n\`\`\`\n${logText}\n\`\`\``;
+  }
 }
 ```
 
-> **Lưu ý**: Gateway (Node.js) và Worker (Python) giao tiếp qua Redis queue bằng JSON.
-> Worker đọc `chat_id` từ payload để biết gửi log về đúng Telegram user.
+---
+
+## 2. Telegram Notifier (already in Step 3)
+
+The `notifier.js` from Step 3 handles sending messages to Telegram via Bot API.
+It supports automatic message chunking for the 4096-char limit.
+
+**workers/src/notifier.js** (from Step 3):
+
+```javascript
+import { config } from './config.js';
+
+const API_BASE = `https://api.telegram.org/bot${config.telegramBotToken}`;
+
+export async function sendTelegramMessage(chatId, text) { /* ... */ }
+```
+
+Additionally, add a convenience `sendStatus` function:
+
+```javascript
+/**
+ * Send a short status update to Telegram.
+ * @param {number|string} chatId
+ * @param {string} sessionId
+ * @param {string} status - 'queued', 'running', 'done', 'error'
+ */
+export async function sendStatus(chatId, sessionId, status) {
+  const icons = { queued: '📋', running: '🔄', done: '✅', error: '❌' };
+  const icon = icons[status] || '❓';
+  const msg = `${icon} Session \`${sessionId}\`: ${status}`;
+
+  try {
+    await fetch(`${API_BASE}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' }),
+    });
+  } catch (err) {
+    console.error('❌ Failed to send status:', err.message);
+  }
+}
+```
+
+---
+
+## 3. Updated Worker with Log Streaming
+
+Update **workers/src/worker.js** — integrate LogCollector and real-time log streaming:
+
+```javascript
+import Docker from 'dockerode';
+import fs from 'node:fs';
+import path from 'node:path';
+import { config } from './config.js';
+import { LogCollector } from './log-collector.js';
+
+const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+
+/**
+ * Execute a task with full log collection.
+ */
+export async function executeTask(taskData) {
+  const { session_id, task, chat_id } = taskData;
+  const workspacePath = path.join(config.workspaceBase, session_id);
+  const containerName = `openhands-${session_id}`;
+
+  const collector = new LogCollector(session_id);
+  collector.add(`Task: ${task}`);
+
+  console.log(`\n🚀 Starting task: ${session_id}`);
+  fs.mkdirSync(workspacePath, { recursive: true });
+
+  try {
+    // Pull image if needed
+    try {
+      await docker.getImage(config.openhandsImage).inspect();
+    } catch {
+      collector.add('Pulling OpenHands image...');
+      await new Promise((resolve, reject) => {
+        docker.pull(config.openhandsImage, (err, stream) => {
+          if (err) return reject(err);
+          docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
+        });
+      });
+      collector.add('Image pulled');
+    }
+
+    // Create and start container
+    const container = await docker.createContainer({
+      Image: config.openhandsImage,
+      name: containerName,
+      Env: [`SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.openhandsImage}`],
+      HostConfig: {
+        Binds: [`${workspacePath}:/workspace:rw`],
+        NetworkMode: 'bridge',
+        Memory: config.memLimit,
+        NanoCpus: config.cpuLimit * 1e9,
+        AutoRemove: true,
+      },
+      Cmd: ['python', '-m', 'openhands.core.main', '-t', task],
+    });
+
+    await container.start();
+    collector.add(`Container started: ${containerName}`);
+
+    // Stream logs in real-time
+    const logStream = await container.logs({
+      follow: true,
+      stdout: true,
+      stderr: true,
+    });
+
+    logStream.on('data', (chunk) => {
+      const lines = chunk.toString('utf-8').split('\n').filter(Boolean);
+      lines.forEach((line) => collector.add(line));
+    });
+
+    // Wait for completion
+    const waitResult = await container.wait(config.taskTimeout);
+    const statusCode = waitResult.StatusCode;
+
+    // Final log capture (in case stream missed anything)
+    try {
+      const finalLogs = await container.logs({ stdout: true, stderr: true });
+      const finalText = finalLogs.toString('utf-8');
+      if (finalText && !collector.logs.length) {
+        finalText.split('\n').filter(Boolean).forEach(l => collector.add(l));
+      }
+    } catch { /* container auto-removed */ }
+
+    const status = statusCode === 0 ? 'done' : 'error';
+
+    // Save logs to file
+    const logDir = path.join(config.workspaceBase, '..', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, `${session_id}.log`),
+      collector.logs.join('\n')
+    );
+
+    console.log(`📋 Task ${session_id}: ${status} (exit ${statusCode})`);
+    return { status, logs: collector.getSummary(status), exitCode: statusCode };
+
+  } catch (err) {
+    collector.add(`Error: ${err.message}`);
+    console.error(`❌ Task ${session_id} failed:`, err.message);
+
+    try {
+      await docker.getContainer(containerName).kill();
+    } catch { /* already gone */ }
+
+    return { status: 'error', logs: collector.getSummary('error'), exitCode: -1 };
+  }
+}
+```
+
+---
+
+## 4. Updated Main Worker Loop
+
+Update **workers/src/index.js** — use sendStatus and log streaming:
+
+```javascript
+import Redis from 'ioredis';
+import { config } from './config.js';
+import { executeTask } from './worker.js';
+import { sendTelegramMessage, sendStatus } from './notifier.js';
+
+const redis = new Redis(config.redisUrl, {
+  maxRetriesPerRequest: 3,
+  retryStrategy(times) { return Math.min(times * 200, 5000); },
+});
+
+redis.on('connect', () => console.log('✅ Worker Redis connected'));
+redis.on('error', (err) => console.error('❌ Redis error:', err.message));
+
+const TASK_QUEUE = 'task_queue';
+const POLL_TIMEOUT = 5;
+
+async function runWorker() {
+  console.log('🔄 Worker started, waiting for tasks...');
+
+  while (true) {
+    try {
+      const result = await redis.blpop(TASK_QUEUE, POLL_TIMEOUT);
+      if (!result) continue;
+
+      const [, raw] = result;
+      const taskData = JSON.parse(raw);
+
+      console.log(`\n📨 Dequeued: ${taskData.session_id}`);
+
+      // Notify: running
+      if (taskData.chat_id) {
+        await sendStatus(taskData.chat_id, taskData.session_id, 'running');
+      }
+
+      // Execute
+      const execResult = await executeTask(taskData);
+
+      // Notify: finished with logs
+      if (taskData.chat_id) {
+        await sendTelegramMessage(taskData.chat_id, execResult.logs);
+      }
+
+    } catch (err) {
+      console.error('❌ Worker loop error:', err.message);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+process.once('SIGINT', () => { redis.disconnect(); process.exit(0); });
+process.once('SIGTERM', () => { redis.disconnect(); process.exit(0); });
+
+runWorker();
+```
+
+---
+
+## 5. Gateway — chat_id (already implemented)
+
+The Gateway already passes `chat_id` in the Redis payload (from Step 2).
+No changes needed — the worker reads `chat_id` from the task data.
+
+> **Note**: Both Gateway and Worker use Node.js and communicate via Redis queue using JSON.
 
 ---
 
 ## 6. Log File Storage
 
-Lưu logs vào file để debug:
+Worker automatically saves logs to `/app/logs/{session_id}.log` (see worker.js above).
+Logs are accessible via:
 
-```python
-# Thêm vào workers/config.py
-import os
-LOG_DIR = os.getenv("LOG_DIR", "/opt/ai-agent/logs")
-```
+```bash
+# On server
+ls -la /opt/ai-agent/logs/
 
-Worker tự động ghi log file:
-
-```python
-# Trong execute_task(), sau khi hoàn thành:
-log_file = f"{LOG_DIR}/{session_id}.log"
-with open(log_file, "w") as f:
-    f.write("\n".join(collector.logs))
+# Or via Docker
+docker compose exec worker ls /app/logs/
 ```
 
 ---
@@ -289,17 +327,19 @@ docker compose up --build -d
 2. Bot reply: 📋 Task queued!
 3. Vài giây sau: 🔄 Session session_xxx: running
 4. Khi hoàn thành: ✅ Task DONE + logs (50 dòng cuối)
+5. Log file saved: /opt/ai-agent/logs/session_xxx.log
 ```
 
 ---
 
 ## Kết quả Step 4
 
-- [x] Logs stream real-time từ container
-- [x] Summary message gửi về Telegram
-- [x] Tin nhắn tự động chia nhỏ nếu quá dài
-- [x] Log files lưu tại `/opt/ai-agent/logs/`
-- [x] chat_id truyền từ gateway → worker
+- [x] Real-time log streaming from container
+- [x] Summary message sent to Telegram
+- [x] Auto-chunk messages over 4096 chars
+- [x] Log files saved at `/opt/ai-agent/logs/`
+- [x] chat_id passed from Gateway → Worker via Redis
+- [x] All in Node.js (dockerode + ioredis + fetch)
 
 ---
 
