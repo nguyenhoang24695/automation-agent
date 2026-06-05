@@ -1,8 +1,8 @@
-# Step 2: Build Minimal Gateway API
+# Step 2: Build Minimal Gateway API (Node.js)
 
 ## Mục tiêu
 
-Xây dựng Gateway API — lớp orchestration nhận lệnh từ Telegram, đẩy task vào hàng đợi, và quản lý worker.
+Xây dựng Gateway API bằng Node.js — lớp orchestration nhận lệnh từ Telegram, đẩy task vào hàng đợi, và quản lý worker.
 
 ---
 
@@ -11,13 +11,13 @@ Xây dựng Gateway API — lớp orchestration nhận lệnh từ Telegram, đ�
 ```text
 Telegram User
      ↓ (message)
-aiogram Bot Handler
+Telegraf Bot Handler
      ↓ (validate user)
-FastAPI Gateway
+Express API
      ↓ (enqueue task)
-Redis Queue
+Redis Queue (ioredis)
      ↓ (notify)
-Worker Manager
+Worker Manager (Python)
 ```
 
 ---
@@ -27,184 +27,241 @@ Worker Manager
 ```text
 /opt/ai-agent/gateway/
 ├── Dockerfile
-├── requirements.txt
-├── main.py
-├── bot/
-│   ├── __init__.py
-│   ├── handlers.py
-│   └── whitelist.py
-├── api/
-│   ├── __init__.py
-│   └── routes.py
-├── queue/
-│   ├── __init__.py
-│   └── redis_queue.py
-└── config.py
+├── package.json
+├── src/
+│   ├── index.js
+│   ├── config.js
+│   ├── bot/
+│   │   ├── telegram.js
+│   │   └── whitelist.js
+│   ├── api/
+│   │   └── routes.js
+│   └── queue/
+│       └── redis.js
+└── .dockerignore
 ```
 
 ---
 
 ## 2. Dependencies
 
-**requirements.txt:**
+**package.json:**
 
-```text
-fastapi==0.115.*
-uvicorn==0.32.*
-aiogram==3.*
-redis==5.*
-python-dotenv==1.*
-httpx==0.27.*
+```json
+{
+  "name": "ai-agent-gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "telegraf": "^4.16.0",
+    "ioredis": "^5.4.0",
+    "dotenv": "^16.4.0"
+  }
+}
 ```
 
 ---
 
 ## 3. Config
 
-**config.py:**
+**src/config.js:**
 
-```python
-import os
-from dotenv import load_dotenv
+```javascript
+import 'dotenv/config';
 
-load_dotenv()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USERS = [int(uid) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid]
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8000"))
+export const config = {
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+  allowedUsers: (process.env.ALLOWED_USERS || '')
+    .split(',')
+    .map(id => parseInt(id.trim()))
+    .filter(Boolean),
+  redisUrl: process.env.REDIS_URL || 'redis://redis:6379/0',
+  gatewayPort: parseInt(process.env.GATEWAY_PORT || '8000'),
+};
 ```
 
 ---
 
 ## 4. Telegram Whitelist
 
-**bot/whitelist.py:**
+**src/bot/whitelist.js:**
 
-```python
-from config import ALLOWED_USERS
+```javascript
+import { config } from '../config.js';
 
-def is_allowed(user_id: int) -> bool:
-    """Kiểm tra user có trong whitelist không."""
-    return user_id in ALLOWED_USERS
+/**
+ * Kiểm tra user có trong whitelist không.
+ */
+export function isAllowed(userId) {
+  return config.allowedUsers.includes(userId);
+}
 ```
 
 ---
 
-## 5. Bot Handlers
+## 5. Redis Queue
 
-**bot/handlers.py:**
+**src/queue/redis.js:**
 
-```python
-from aiogram import Router, types
-from aiogram.filters import Command
-from bot.whitelist import is_allowed
-from queue.redis_queue import enqueue_task
+```javascript
+import Redis from 'ioredis';
+import { config } from '../config.js';
 
-router = Router()
+const redis = new Redis(config.redisUrl);
+const TASK_QUEUE = 'task_queue';
 
-@router.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
-    await message.answer("🤖 AI Coding Agent ready. Send a task to begin.")
+/**
+ * Đẩy task vào Redis queue.
+ */
+export async function enqueueTask(sessionId, task, chatId) {
+  const payload = JSON.stringify({ session_id: sessionId, task, chat_id: chatId });
+  await redis.rpush(TASK_QUEUE, payload);
+}
 
-@router.message()
-async def handle_task(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
+/**
+ * Lấy task từ Redis queue.
+ */
+export async function dequeueTask() {
+  const result = await redis.lpop(TASK_QUEUE);
+  return result ? JSON.parse(result) : null;
+}
 
-    task_text = message.text
-    session_id = f"session_{message.from_user.id}_{message.message_id}"
+/**
+ * Lấy số lượng task trong queue.
+ */
+export async function getQueueSize() {
+  return await redis.llen(TASK_QUEUE);
+}
 
-    await enqueue_task(session_id, task_text)
-    await message.answer(f"📋 Task received!\nSession: `{session_id}`\nStatus: Queued")
+export { redis };
 ```
 
 ---
 
-## 6. Redis Queue
+## 6. Bot Handlers
 
-**queue/redis_queue.py:**
+**src/bot/telegram.js:**
 
-```python
-import json
-import redis.asyncio as redis
-from config import REDIS_URL
+```javascript
+import { Telegraf } from 'telegraf';
+import { config } from '../config.js';
+import { isAllowed } from './whitelist.js';
+import { enqueueTask } from '../queue/redis.js';
 
-redis_client = redis.from_url(REDIS_URL)
-TASK_QUEUE = "task_queue"
+const bot = new Telegraf(config.telegramBotToken);
 
-async def enqueue_task(session_id: str, task: str):
-    """Đẩy task vào Redis queue."""
-    payload = json.dumps({"session_id": session_id, "task": task})
-    await redis_client.rpush(TASK_QUEUE, payload)
+// /start command
+bot.start((ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
+  return ctx.reply('🤖 AI Coding Agent ready. Send a task to begin.');
+});
 
-async def dequeue_task():
-    """Lấy task từ Redis queue."""
-    result = await redis_client.lpop(TASK_QUEUE)
-    if result:
-        return json.loads(result)
-    return None
+// Handle all messages
+bot.on('text', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
+
+  const taskText = ctx.message.text;
+  const sessionId = `session_${ctx.from.id}_${ctx.message.message_id}`;
+
+  await enqueueTask(sessionId, taskText, ctx.chat.id);
+  await ctx.reply(`📋 Task received!\nSession: \`${sessionId}\`\nStatus: Queued`, {
+    parse_mode: 'Markdown',
+  });
+});
+
+/**
+ * Khởi động bot (long polling).
+ */
+export async function startBot() {
+  console.log('🤖 Telegram bot started (polling)');
+  await bot.launch();
+}
+
+/**
+ * Dừng bot gracefully.
+ */
+export async function stopBot() {
+  await bot.stop();
+  console.log('🤖 Telegram bot stopped');
+}
+
+export { bot };
 ```
 
 ---
 
 ## 7. API Routes
 
-**api/routes.py:**
+**src/api/routes.js:**
 
-```python
-from fastapi import APIRouter
-from queue.redis_queue import redis_client
+```javascript
+import { Router } from 'express';
+import { getQueueSize } from '../queue/redis.js';
 
-router = APIRouter(prefix="/api", tags=["health"])
+const router = Router();
 
-@router.get("/health")
-async def health_check():
-    return {"status": "ok"}
+// Health check
+router.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
 
-@router.get("/queue/size")
-async def queue_size():
-    size = await redis_client.llen("task_queue")
-    return {"queue_size": size}
+// Queue size
+router.get('/queue/size', async (req, res) => {
+  const size = await getQueueSize();
+  res.json({ queue_size: size });
+});
+
+export default router;
 ```
 
 ---
 
 ## 8. Main Entry Point
 
-**main.py:**
+**src/index.js:**
 
-```python
-import asyncio
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from aiogram import Bot, Dispatcher
-from bot.handlers import router as bot_router
-from api.routes import router as api_router
-from config import TELEGRAM_BOT_TOKEN, GATEWAY_PORT
-import uvicorn
+```javascript
+import express from 'express';
+import { config } from './config.js';
+import { startBot, stopBot } from './bot/telegram.js';
+import apiRoutes from './api/routes.js';
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
-dp.include_router(bot_router)
+const app = express();
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: bắt đầu polling Telegram
-    asyncio.create_task(dp.start_polling(bot))
-    yield
-    # Shutdown
-    await bot.session.close()
+// API routes
+app.use('/api', apiRoutes);
 
-app = FastAPI(title="AI Agent Gateway", lifespan=lifespan)
-app.include_router(api_router)
+// Start Express server
+const server = app.listen(config.gatewayPort, () => {
+  console.log(`🚀 Gateway API listening on port ${config.gatewayPort}`);
+});
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=GATEWAY_PORT)
+// Start Telegram bot (long polling)
+startBot();
+
+// Graceful shutdown
+process.once('SIGINT', async () => {
+  console.log('Shutting down...');
+  await stopBot();
+  server.close();
+  process.exit(0);
+});
+
+process.once('SIGTERM', async () => {
+  console.log('Shutting down...');
+  await stopBot();
+  server.close();
+  process.exit(0);
+});
 ```
 
 ---
@@ -214,18 +271,27 @@ if __name__ == "__main__":
 **Dockerfile:**
 
 ```dockerfile
-FROM python:3.11-slim
+FROM node:20-alpine
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev
 
-COPY . .
+# Copy source
+COPY src/ ./src/
 
 EXPOSE 8000
 
-CMD ["python", "main.py"]
+CMD ["node", "src/index.js"]
+```
+
+**.dockerignore:**
+
+```text
+node_modules
+npm-debug.log
 ```
 
 ---
@@ -244,8 +310,10 @@ services:
       - ./secrets/telegram.env
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - NODE_ENV=production
     depends_on:
       - redis
+    restart: unless-stopped
     volumes:
       - ./logs:/app/logs
 
@@ -253,6 +321,7 @@ services:
     image: redis:7-alpine
     volumes:
       - ./redis/data:/data
+    restart: unless-stopped
 ```
 
 ---
@@ -271,22 +340,39 @@ docker compose up --build -d
 ```bash
 # Health check
 curl http://localhost:8000/api/health
+# → {"status":"ok","uptime":12.345}
 
 # Queue size
 curl http://localhost:8000/api/queue/size
+# → {"queue_size":0}
 
-# Gửi tin nhắn Telegram cho bot → bot reply "Task received!"
+# Gửi tin nhắn Telegram cho bot → bot reply "📋 Task received!"
+
+# Xem logs
+docker compose logs -f gateway
 ```
+
+---
+
+## 13. Troubleshooting
+
+| Vấn đề | Nguyên nhân | Cách xử lý |
+|---------|-------------|------------|
+| Bot không phản hồi | Token sai | Kiểm tra `TELEGRAM_BOT_TOKEN` |
+| Access denied | User ID sai | Kiểm tra `ALLOWED_USERS` |
+| Redis connection refused | Redis chưa sẵn sàng | Kiểm tra `depends_on: redis` |
+| Port 8000 bị chiếm | Process khác đang dùng | Đổi `GATEWAY_PORT` hoặc stop process |
 
 ---
 
 ## Kết quả Step 2
 
-- [x] Gateway API chạy trên port 8000
-- [x] Telegram bot nhận và phản hồi tin nhắn
+- [x] Gateway API chạy trên port 8000 (Node.js + Express)
+- [x] Telegram bot nhận và phản hồi tin nhắn (Telegraf)
 - [x] Whitelist chặn user không hợp lệ
-- [x] Task được đẩy vào Redis queue
-- [x] Health check endpoint hoạt động
+- [x] Task được đẩy vào Redis queue (ioredis)
+- [x] Health check + queue size endpoints
+- [x] Graceful shutdown (SIGINT/SIGTERM)
 
 ---
 

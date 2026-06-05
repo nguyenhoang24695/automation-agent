@@ -76,13 +76,18 @@ No need yet:
 
 # Recommended Stack
 
-## Backend
+## Gateway API
+
+* Node.js 20
+* Express
+* Telegraf (Telegram bot)
+* ioredis
+
+## Worker
 
 * Python 3.11
-* FastAPI
-* aiogram
-* Redis
 * Docker SDK
+* Redis
 
 ## AI
 
