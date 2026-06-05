@@ -213,38 +213,42 @@ if __name__ == "__main__":
 
 ---
 
-## 5. Cập nhật Gateway — Truyền chat_id
+## 5. Cập nhật Gateway (Node.js) — Truyền chat_id
 
-Sửa **gateway/bot/handlers.py** — thêm `chat_id` vào task payload:
+Sửa **gateway/src/bot/telegram.js** — thêm `chat_id` vào task payload:
 
-```python
-@router.message()
-async def handle_task(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
+```javascript
+// Handle all messages
+bot.on('text', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
 
-    session_id = f"session_{message.from_user.id}_{message.message_id}"
+  const taskText = ctx.message.text;
+  const sessionId = `session_${ctx.from.id}_${ctx.message.message_id}`;
 
-    await enqueue_task(
-        session_id=session_id,
-        task=message.text,
-        chat_id=message.chat.id,  # ← truyền chat_id cho worker
-    )
-    await message.answer(f"📋 Task queued!\nSession: `{session_id}`")
+  await enqueueTask(sessionId, taskText, ctx.chat.id); // ← chat_id truyền cho worker
+  await ctx.reply(`📋 Task queued!\nSession: \`${sessionId}\``, {
+    parse_mode: 'Markdown',
+  });
+});
 ```
 
-Sửa **gateway/queue/redis_queue.py:**
+Sửa **gateway/src/queue/redis.js** — đảm bảo `enqueueTask` nhận `chatId`:
 
-```python
-async def enqueue_task(session_id: str, task: str, chat_id: int):
-    payload = json.dumps({
-        "session_id": session_id,
-        "task": task,
-        "chat_id": chat_id,
-    })
-    await redis_client.rpush(TASK_QUEUE, payload)
+```javascript
+export async function enqueueTask(sessionId, task, chatId) {
+  const payload = JSON.stringify({
+    session_id: sessionId,
+    task,
+    chat_id: chatId, // ← truyền chat_id cho worker
+  });
+  await redis.rpush(TASK_QUEUE, payload);
+}
 ```
+
+> **Lưu ý**: Gateway (Node.js) và Worker (Python) giao tiếp qua Redis queue bằng JSON.
+> Worker đọc `chat_id` từ payload để biết gửi log về đúng Telegram user.
 
 ---
 

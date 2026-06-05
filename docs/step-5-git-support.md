@@ -157,75 +157,71 @@ Cập nhật **docker-compose.yml** — thêm volume cho worker:
 
 ---
 
-## 4. Bot Commands — Git Handlers
+## 4. Bot Commands — Git Handlers (Node.js)
 
-Thêm vào **gateway/bot/handlers.py:**
+Thêm vào **gateway/src/bot/telegram.js:**
 
-```python
-from aiogram.filters import Command, CommandObject
-from queue.redis_queue import enqueue_task
+```javascript
+import { enqueueTask } from '../queue/redis.js';
 
-@router.message(Command("clone"))
-async def cmd_clone(message: types.Message, command: CommandObject):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
+// /clone <repo_url>
+bot.command('clone', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
 
-    if not command.args:
-        await message.answer("Usage: /clone <repo_url>")
-        return
+  const repoUrl = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!repoUrl) {
+    return ctx.reply('Usage: /clone <repo_url>');
+  }
 
-    repo_url = command.args.strip()
-    session_id = f"session_{message.from_user.id}_{message.message_id}"
+  const sessionId = `session_${ctx.from.id}_${ctx.message.message_id}`;
+  await enqueueTask(sessionId, `[GIT_CLONE] ${repoUrl}`, ctx.chat.id);
+  await ctx.reply(`📦 Cloning repo...\nSession: \`${sessionId}\``, {
+    parse_mode: 'Markdown',
+  });
+});
 
-    await enqueue_task(
-        session_id=session_id,
-        task=f"[GIT_CLONE] {repo_url}",
-        chat_id=message.chat.id,
-    )
-    await message.answer(f"📦 Cloning repo...\nSession: `{session_id}`")
+// /commit <session_id> <message>
+bot.command('commit', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
 
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) {
+    return ctx.reply('Usage: /commit <session_id> <message>');
+  }
 
-@router.message(Command("commit"))
-async def cmd_commit(message: types.Message, command: CommandObject):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
+  const sessionId = args[0];
+  const commitMsg = args.slice(1).join(' ') || 'auto-commit by AI agent';
 
-    if not command.args:
-        await message.answer("Usage: /commit <session_id> <message>")
-        return
+  await enqueueTask(sessionId, `[GIT_COMMIT] ${commitMsg}`, ctx.chat.id);
+  await ctx.reply(`💾 Committing...\nSession: \`${sessionId}\``, {
+    parse_mode: 'Markdown',
+  });
+});
 
-    parts = command.args.split(maxsplit=1)
-    session_id = parts[0]
-    commit_msg = parts[1] if len(parts) > 1 else "auto-commit by AI agent"
+// /push <session_id>
+bot.command('push', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
 
-    await enqueue_task(
-        session_id=session_id,
-        task=f"[GIT_COMMIT] {commit_msg}",
-        chat_id=message.chat.id,
-    )
-    await message.answer(f"💾 Committing...\nSession: `{session_id}`")
+  const sessionId = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!sessionId) {
+    return ctx.reply('Usage: /push <session_id>');
+  }
 
-
-@router.message(Command("push"))
-async def cmd_push(message: types.Message, command: CommandObject):
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
-
-    if not command.args:
-        await message.answer("Usage: /push <session_id>")
-        return
-
-    session_id = command.args.strip()
-    await enqueue_task(
-        session_id=session_id,
-        task="[GIT_PUSH]",
-        chat_id=message.chat.id,
-    )
-    await message.answer(f"📤 Pushing...\nSession: `{session_id}`")
+  await enqueueTask(sessionId, '[GIT_PUSH]', ctx.chat.id);
+  await ctx.reply(`📤 Pushing...\nSession: \`${sessionId}\``, {
+    parse_mode: 'Markdown',
+  });
+});
 ```
+
+> **Lưu ý**: Gateway (Node.js) parse commands và đẩy task vào Redis queue.
+> Worker (Python) nhận task từ queue và thực thi Git operations.
 
 ---
 

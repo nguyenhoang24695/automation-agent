@@ -176,47 +176,42 @@ async def auto_stop_tunnel(session_id: str, delay: int):
 
 ---
 
-## 4. Bot Command — Tunnel Control
+## 4. Bot Command — Tunnel Control (Node.js)
 
-Thêm vào **gateway/bot/handlers.py:**
+Thêm vào **gateway/src/bot/telegram.js:**
 
-```python
-@router.message(Command("tunnel"))
-async def cmd_tunnel(message: types.Message, command: CommandObject):
-    """Manually start/stop tunnel cho session."""
-    if not is_allowed(message.from_user.id):
-        await message.answer("⛔ Access denied.")
-        return
+```javascript
+// /tunnel start <session_id> <port>
+// /tunnel stop <session_id>
+bot.command('tunnel', async (ctx) => {
+  if (!isAllowed(ctx.from.id)) {
+    return ctx.reply('⛔ Access denied.');
+  }
 
-    if not command.args:
-        await message.answer("Usage:\n/tunnel start <session_id> <port>\n/tunnel stop <session_id>")
-        return
+  const args = ctx.message.text.split(' ').slice(1);
+  const action = args[0];
 
-    parts = command.args.split()
-    action = parts[0]
+  if (action === 'start' && args.length >= 2) {
+    const sessionId = args[1];
+    const port = parseInt(args[2]) || 3000;
+    await enqueueTask(sessionId, `[TUNNEL_START] port=${port}`, ctx.chat.id);
+    return ctx.reply(`🌐 Starting tunnel on port ${port}...`);
+  }
 
-    if action == "start" and len(parts) >= 2:
-        session_id = parts[1]
-        port = int(parts[2]) if len(parts) > 2 else 3000
-        await enqueue_task(
-            session_id=session_id,
-            task=f"[TUNNEL_START] port={port}",
-            chat_id=message.chat.id,
-        )
-        await message.answer(f"🌐 Starting tunnel on port {port}...")
+  if (action === 'stop' && args.length >= 2) {
+    const sessionId = args[1];
+    await enqueueTask(sessionId, '[TUNNEL_STOP]', ctx.chat.id);
+    return ctx.reply('🛑 Stopping tunnel...');
+  }
 
-    elif action == "stop" and len(parts) >= 2:
-        session_id = parts[1]
-        await enqueue_task(
-            session_id=session_id,
-            task="[TUNNEL_STOP]",
-            chat_id=message.chat.id,
-        )
-        await message.answer(f"🛑 Stopping tunnel...")
-
-    else:
-        await message.answer("Usage:\n/tunnel start <session_id> <port>\n/tunnel stop <session_id>")
+  return ctx.reply(
+    'Usage:\n/tunnel start <session_id> <port>\n/tunnel stop <session_id>'
+  );
+});
 ```
+
+> **Lưu ý**: Gateway (Node.js) nhận command và đẩy task vào Redis.
+> Worker (Python) xử lý tunnel lifecycle qua `tunnel_helper.py`.
 
 ---
 
