@@ -1,122 +1,154 @@
-import { Client } from 'ssh2';
+/**
+ * Deploy — Upload all service files and rebuild everything.
+ * 
+ * Usage:
+ *   node scripts/deploy.js          # Full rebuild (worker + sdk-service)
+ *   node scripts/deploy.js worker   # Worker only
+ *   node scripts/deploy.js sdk      # SDK service only
+ */
 
-const SSH_CONFIG = {
-  host: '192.168.5.123',
-  port: 22,
-  username: 'ubuntu',
-  password: 'Admin@123',
-  readyTimeout: 10000,
+import { Client } from 'ssh2';
+import fs from 'fs';
+import path from 'path';
+
+const SSH = {
+  host: process.env.SSH_HOST || '192.168.5.123',
+  port: parseInt(process.env.SSH_PORT || '22'),
+  username: process.env.SSH_USER || 'ubuntu',
+  password: process.env.SSH_PASS || 'Admin@123',
+  readyTimeout: 15000,
 };
 
-const REPO_URL = 'https://github.com/nguyenhoang24695/automation-agent.git';
+const SUDO = `echo ${SSH.password} | sudo -S`;
 const PROJECT_DIR = '/home/ubuntu/automation-agent';
 
-function sshExec(command, label = '', showOutput = false) {
+function sshExec(cmd, label = '', timeout = 300000) {
   return new Promise((resolve, reject) => {
-    const conn = new Client();
-    let stdout = '';
-    let stderr = '';
-
-    conn.on('ready', () => {
-      if (label) console.log(`\n▶ ${label}`);
-      conn.exec(command, (err, stream) => {
-        if (err) { conn.end(); reject(err); return; }
-        stream.on('data', (data) => {
-          stdout += data.toString();
-          if (showOutput) process.stdout.write(data.toString());
-        });
-        stream.stderr.on('data', (data) => {
-          stderr += data.toString();
-          if (showOutput) process.stderr.write(data.toString());
-        });
-        stream.on('close', (code) => {
-          conn.end();
-          if (code === 0) {
-            if (label) console.log(`  ✅ Done`);
-          } else {
-            console.log(`  ⚠️  Exit code: ${code}`);
-            if (stderr) console.log(`  stderr: ${stderr.slice(0, 200)}`);
-          }
-          resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() });
-        });
+    const c = new Client();
+    let out = '';
+    const timer = setTimeout(() => { c.end(); reject(new Error('SSH timeout')); }, timeout);
+    c.on('ready', () => {
+      if (label) console.log(`\n=== ${label} ===`);
+      c.exec(cmd, (e, s) => {
+        if (e) { clearTimeout(timer); c.end(); reject(e); return; }
+        s.on('data', d => { out += d; process.stdout.write(d); });
+        s.stderr.on('data', d => { process.stderr.write(d); });
+        s.on('close', () => { clearTimeout(timer); c.end(); resolve(out.trim()); });
       });
     });
-
-    conn.on('error', (err) => {
-      console.error(`❌ SSH error (${label}):`, err.message);
-      reject(err);
-    });
-
-    conn.connect(SSH_CONFIG);
+    c.on('error', reject);
+    c.connect(SSH);
   });
 }
 
-// --- Deploy Steps ---
-
-console.log('🚀 Deploying AI Agent to Ubuntu server...\n');
-console.log(`Server: ${SSH_CONFIG.username}@${SSH_CONFIG.host}`);
-console.log(`Repo: ${REPO_URL}`);
-console.log(`Target: ${PROJECT_DIR}`);
-
-// Step 1: Clone or update repo
-const checkDir = await sshExec(`test -d ${PROJECT_DIR}/.git && echo 'exists' || echo 'new'`);
-if (checkDir.stdout.includes('exists')) {
-  await sshExec(`cd ${PROJECT_DIR} && git pull origin main`, 'Pulling latest code', true);
-} else {
-  await sshExec(`git clone ${REPO_URL} ${PROJECT_DIR}`, 'Cloning repository', true);
+function uploadFile(localPath, remotePath) {
+  return new Promise((resolve, reject) => {
+    const c = new Client();
+    c.on('ready', () => {
+      c.sftp((err, sftp) => {
+        if (err) { c.end(); reject(err); return; }
+        const readStream = fs.createReadStream(localPath);
+        const writeStream = sftp.createWriteStream(remotePath);
+        writeStream.on('close', () => { c.end(); resolve(); });
+        writeStream.on('error', (e) => { c.end(); reject(e); });
+        readStream.pipe(writeStream);
+      });
+    });
+    c.on('error', reject);
+    c.connect(SSH);
+  });
 }
 
-// Step 2: Create .env from .env.example
+const target = process.argv[2] || 'all';
+
+console.log(`\n🚀 Deploy (${target})\n`);
+
+// Ensure remote directories exist
+await sshExec(`mkdir -p ${PROJECT_DIR}/workers/src ${PROJECT_DIR}/sdk-service ${PROJECT_DIR}/gateway/src/api ${PROJECT_DIR}/gateway/src/bot ${PROJECT_DIR}/gateway/src/queue`, 'Prepare directories');
+
+// Upload worker files
+if (target === 'all' || target === 'worker') {
+  const workerFiles = ['index.js', 'config.js', 'worker.js', 'log-collector.js', 'notifier.js'];
+  for (const file of workerFiles) {
+    const local = path.resolve('workers/src', file);
+    if (!fs.existsSync(local)) { console.log(`⚠️  Skipping ${file}`); continue; }
+    console.log(`📤 workers/src/${file}`);
+    await uploadFile(local, `${PROJECT_DIR}/workers/src/${file}`);
+  }
+  // Upload package.json and Dockerfile
+  for (const file of ['package.json', 'Dockerfile']) {
+    const local = path.resolve('workers', file);
+    if (fs.existsSync(local)) {
+      console.log(`📤 workers/${file}`);
+      await uploadFile(local, `${PROJECT_DIR}/workers/${file}`);
+    }
+  }
+  console.log('✅ Worker files uploaded');
+}
+
+// Upload gateway files
+if (target === 'all' || target === 'gateway') {
+  const gwFiles = ['index.js', 'config.js'];
+  for (const file of gwFiles) {
+    const local = path.resolve('gateway/src', file);
+    if (!fs.existsSync(local)) { console.log(`⚠️  Skipping ${file}`); continue; }
+    console.log(`📤 gateway/src/${file}`);
+    await uploadFile(local, `${PROJECT_DIR}/gateway/src/${file}`);
+  }
+  const gwSubdirs = ['api', 'bot', 'queue'];
+  for (const subdir of gwSubdirs) {
+    const dir = path.resolve('gateway/src', subdir);
+    if (!fs.existsSync(dir)) continue;
+    for (const file of fs.readdirSync(dir).filter(f => f.endsWith('.js'))) {
+      console.log(`📤 gateway/src/${subdir}/${file}`);
+      await uploadFile(path.join(dir, file), `${PROJECT_DIR}/gateway/src/${subdir}/${file}`);
+    }
+  }
+  for (const file of ['package.json', 'Dockerfile']) {
+    const local = path.resolve('gateway', file);
+    if (fs.existsSync(local)) {
+      console.log(`📤 gateway/${file}`);
+      await uploadFile(local, `${PROJECT_DIR}/gateway/${file}`);
+    }
+  }
+  console.log('✅ Gateway files uploaded');
+}
+
+// Upload sdk-service files
+if (target === 'all' || target === 'sdk') {
+  const sdkFiles = ['app.py', 'Dockerfile', 'requirements.txt', '.dockerignore'];
+  for (const file of sdkFiles) {
+    const local = path.resolve('sdk-service', file);
+    if (!fs.existsSync(local)) { console.log(`⚠️  Skipping ${file}`); continue; }
+    console.log(`📤 sdk-service/${file}`);
+    await uploadFile(local, `${PROJECT_DIR}/sdk-service/${file}`);
+  }
+  console.log('✅ SDK service files uploaded');
+}
+
+// Upload docker-compose.yml
+if (target === 'all') {
+  console.log('📤 docker-compose.yml');
+  await uploadFile(path.resolve('docker-compose.yml'), `${PROJECT_DIR}/docker-compose.yml`);
+}
+
+// Rebuild services
+const services = target === 'all' ? '' :
+  target === 'worker' ? 'worker' :
+  target === 'gateway' ? 'gateway' : 'sdk-service';
+
 await sshExec(
-  `cd ${PROJECT_DIR} && test -f .env && echo 'env exists' || cp .env.example .env`,
-  'Creating .env file'
+  `cd ${PROJECT_DIR} && ${SUDO} docker compose build ${services} && ${SUDO} docker compose up -d`,
+  `Rebuild & restart (${services || 'all'})`,
+  300000
 );
 
-// Step 3: Create required directories
-await sshExec(
-  `mkdir -p ${PROJECT_DIR}/secrets ${PROJECT_DIR}/logs ${PROJECT_DIR}/redis/data`,
-  'Creating directories'
-);
-
-// Step 4: Check current .env content (to verify credentials)
-const envCheck = await sshExec(`cd ${PROJECT_DIR} && head -30 .env`, 'Checking .env');
-console.log(`  Current .env (first 30 lines):\n${envCheck.stdout}`);
-
-// Step 5: Add ubuntu user to docker group (if needed)
-await sshExec(
-  'echo Admin@123 | sudo -S usermod -aG docker ubuntu 2>/dev/null; echo done',
-  'Ensuring docker group membership'
-);
-
-// Step 6: Build Docker image
-await sshExec(
-  `cd ${PROJECT_DIR} && echo Admin@123 | sudo -S docker compose build --no-cache`,
-  'Building Docker image (this may take a few minutes...)',
-  true
-);
-
-// Step 7: Start services
-await sshExec(
-  `cd ${PROJECT_DIR} && echo Admin@123 | sudo -S docker compose up -d`,
-  'Starting services',
-  true
-);
-
-// Step 8: Wait for services to start
-console.log('\n⏳ Waiting 5 seconds for services to start...');
+// Wait for startup
 await new Promise(r => setTimeout(r, 5000));
 
-// Step 9: Verify
-const healthCheck = await sshExec('curl -s http://localhost:8000/api/health', 'Health check');
-console.log(`  Response: ${healthCheck.stdout}`);
+// Check status
+await sshExec(`cd ${PROJECT_DIR} && ${SUDO} docker compose ps`, 'Service status');
+await sshExec(`cd ${PROJECT_DIR} && ${SUDO} docker compose logs --tail=5 sdk-service`, 'SDK Service logs');
+await sshExec(`cd ${PROJECT_DIR} && ${SUDO} docker compose logs --tail=5 worker`, 'Worker logs');
 
-const queueCheck = await sshExec('curl -s http://localhost:8000/api/queue/size', 'Queue check');
-console.log(`  Response: ${queueCheck.stdout}`);
-
-const containerCheck = await sshExec('echo Admin@123 | sudo -S docker compose ps', 'Container status', true);
-
-console.log('\n🎉 Deployment complete!');
-console.log('Next steps:');
-console.log('  1. Test your Telegram bot — send /start');
-console.log('  2. Check logs: sudo docker compose logs -f gateway');
-console.log('  3. To enable Zalo: edit .env → set ZALO_ENABLED=true → sudo docker compose restart');
+console.log('\n✅ Deploy complete! Run: node scripts/test-worker.js');

@@ -132,7 +132,7 @@ function setupListener() {
     }
 
     // Generate session ID: zalo_{userId}_{timestamp}
-    const sessionId = `zalo_${senderId}_${Date.now()}`;
+    const sessionId = `zalo_${senderId}`;
 
     // Enqueue task with Zalo adapter metadata
     await enqueueTask(sessionId, content, senderId, {

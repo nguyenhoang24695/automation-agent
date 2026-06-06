@@ -1,276 +1,86 @@
-import Docker from 'dockerode';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { LogCollector } from './log-collector.js';
 
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+const SDK_SERVICE_URL = config.sdkServiceUrl || 'http://sdk-service:8080';
 
 /**
- * Detect the Docker network this worker container is on.
- * Falls back to 'bridge' if detection fails.
- */
-async function getWorkerNetwork() {
-  try {
-    const hostname = (await fs.promises.readFile('/etc/hostname', 'utf-8')).trim();
-    const workerContainer = docker.getContainer(hostname);
-    const info = await workerContainer.inspect();
-    const networkNames = Object.keys(info.NetworkSettings.Networks);
-    if (networkNames.length > 0) {
-      console.log(`🌐 Worker network: ${networkNames[0]}`);
-      return networkNames[0];
-    }
-  } catch (err) {
-    console.log(`⚠️ Network detection failed: ${err.message}, using bridge`);
-  }
-  return 'bridge';
-}
-
-/**
- * Pull a Docker image if not already available.
- */
-async function pullImageIfMissing(imageName) {
-  try {
-    await docker.getImage(imageName).inspect();
-    console.log(`📦 Image already available: ${imageName}`);
-    return true;
-  } catch {
-    console.log(`📦 Pulling image (this may take a few minutes): ${imageName}`);
-    await new Promise((resolve, reject) => {
-      docker.pull(imageName, (err, stream) => {
-        if (err) return reject(err);
-        docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
-      });
-    });
-    console.log(`✅ Image pulled: ${imageName}`);
-    return true;
-  }
-}
-
-/**
- * Ensure both OpenHands and agent-server images are available.
- */
-async function ensureImages(collector) {
-  // OpenHands main image
-  collector.add('Checking OpenHands image...');
-  await pullImageIfMissing(config.openhandsImage);
-  collector.add(`OpenHands image OK: ${config.openhandsImage}`);
-
-  // Agent-server image (pulled by OpenHands on first conversation — pre-pull to avoid timeout)
-  const agentServerImage = `${config.agentServerRepo}:${config.agentServerTag}`;
-  collector.add('Checking agent-server image...');
-  await pullImageIfMissing(agentServerImage);
-  collector.add(`Agent-server image OK: ${agentServerImage}`);
-}
-
-/**
- * Wait for the OpenHands server to be ready on port 3000.
- * @param {string} containerIp - Container IP on Docker bridge network
- * @param {number} maxWait - Max seconds to wait
- * @returns {boolean}
- */
-async function waitForReady(containerIp, maxWait = 60) {
-  const url = `http://${containerIp}:3000/api/v1/health`;
-  console.log(`⏳ Waiting for OpenHands at ${url}...`);
-
-  for (let i = 0; i < maxWait; i++) {
-    try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
-      if (resp.ok) {
-        console.log('✅ OpenHands server is ready');
-        return true;
-      }
-    } catch { /* not ready yet */ }
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  console.log('⚠️ OpenHands server did not become ready in time');
-  return false;
-}
-
-/**
- * Submit a task to OpenHands via REST API.
- * @param {string} containerIp
- * @param {string} task
- * @returns {string|null} - app_conversation_id or null
- */
-async function submitTask(containerIp, task) {
-  const url = `http://${containerIp}:3000/api/v1/app-conversations`;
-  console.log(`📤 Submitting task to OpenHands...`);
-
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        initial_message: {
-          content: [{ type: 'text', text: task }],
-        },
-      }),
-      signal: AbortSignal.timeout(300000),
-    });
-
-    if (!resp.ok) {
-      const error = await resp.text();
-      console.error(`❌ Submit failed (${resp.status}): ${error}`);
-      return null;
-    }
-
-    const data = await resp.json();
-    const convId = data.app_conversation_id || data.conversation_id || data.id;
-    console.log(`✅ Task submitted — conversation: ${convId}`);
-    return convId;
-
-  } catch (err) {
-    console.error('❌ Submit error:', err.message);
-    return null;
-  }
-}
-
-/**
- * Poll OpenHands API for task completion.
- * @param {string} containerIp
- * @param {string} conversationId
- * @param {number} timeoutSec
- * @returns {{status: string, events: object[]}}
- */
-async function pollForResult(containerIp, conversationId, timeoutSec) {
-  const url = `http://${containerIp}:3000/api/v1/app-conversations/${conversationId}`;
-  const startTime = Date.now();
-
-  console.log(`⏳ Polling for results...`);
-
-  while ((Date.now() - startTime) < timeoutSec * 1000) {
-    try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      if (resp.ok) {
-        const data = await resp.json();
-        const status = data.status || data.state || 'unknown';
-
-        // Check if task is complete
-        if (['done', 'completed', 'finished', 'error', 'failed', 'stopped'].includes(status)) {
-          console.log(`📋 Task finished with status: ${status}`);
-          return { status, data };
-        }
-      }
-    } catch { /* poll error, retry */ }
-
-    await new Promise(r => setTimeout(r, 5000));
-  }
-
-  return { status: 'timeout', data: null };
-}
-
-/**
- * Execute a task by spawning an OpenHands server container.
+ * Execute a task by sending it to the persistent SDK service via HTTP.
+ *
+ * The SDK service maintains conversation objects per session,
+ * enabling context retention across tasks and instant execution
+ * (no container creation, no SDK installation overhead).
  *
  * @param {{session_id: string, task: string, chat_id: number|string, source?: string}} taskData
  * @returns {{status: string, logs: string, exitCode: number}}
  */
 export async function executeTask(taskData) {
-  const { session_id, task, chat_id, source } = taskData;
+  const { session_id, task } = taskData;
   const workspacePath = path.join(config.workspaceBase, session_id);
-  const containerName = `openhands-${session_id}`;
 
-  // Initialize log collector
   const collector = new LogCollector(session_id);
   collector.add(`Task: ${task}`);
 
   console.log(`\n🚀 Starting task: ${session_id}`);
   console.log(`   Task: ${task.slice(0, 100)}${task.length > 100 ? '...' : ''}`);
 
-  // Create workspace directory
+  // Create workspace directory (for host persistence)
   fs.mkdirSync(workspacePath, { recursive: true });
 
-  let container = null;
-
   try {
-    // Ensure both images are available
-    await ensureImages(collector);
+    // Wait for SDK service to be ready (with timeout)
+    await waitForSdkService(collector);
 
-    // Create OpenHands container (as a server)
-    container = await docker.createContainer({
-      Image: config.openhandsImage,
-      name: containerName,
-      Env: [
-        `AGENT_SERVER_IMAGE_REPOSITORY=${config.agentServerRepo}`,
-        `AGENT_SERVER_IMAGE_TAG=${config.agentServerTag}`,
-        'LOG_ALL_EVENTS=true',
-        `SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.agentServerRepo}:${config.agentServerTag}`,
-        // LLM configuration via 9Router (OpenHands uses LiteLLM — expects LLM_BASE_URL)
-        `LLM_BASE_URL=${config.ninerouterUrl}/v1`,
-        `LLM_API_KEY=${config.ninerouterApiKey}`,
-        `LLM_MODEL=${config.ninerouterModel}`,
-      ],
-      ExposedPorts: { '3000/tcp': {} },
-      HostConfig: {
-        Binds: [
-          `${workspacePath}:/opt/workspace_base:rw`,
-          '/var/run/docker.sock:/var/run/docker.sock',
-        ],
-        ExtraHosts: ['host.docker.internal:host-gateway'],
-        PortBindings: {}, // Don't bind to host — use Docker network IP
-        Memory: config.memLimit,
-        NanoCpus: config.cpuLimit * 1e9,
-      },
+    // Send task to SDK service
+    console.log(`📤 Sending task to SDK service: ${SDK_SERVICE_URL}`);
+    collector.add('Sending task to SDK service...');
+
+    const response = await fetch(`${SDK_SERVICE_URL}/task`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id,
+        task,
+        workspace: workspacePath,
+      }),
+      signal: AbortSignal.timeout(config.taskTimeout * 1000),
     });
 
-    await container.start();
-    collector.add(`Container started: ${containerName}`);
-
-    // Connect OpenHands to worker's Docker network so they can communicate
-    const workerNetwork = await getWorkerNetwork();
-    const network = docker.getNetwork(workerNetwork);
-    try {
-      await network.connect({ Container: container.id });
-      collector.add(`Connected to network: ${workerNetwork}`);
-      console.log(`🌐 Connected OpenHands to network: ${workerNetwork}`);
-    } catch (netErr) {
-      // May already be on the network (e.g., bridge)
-      collector.add(`Network connect skipped: ${netErr.message}`);
-      console.log(`⚠️ Network connect: ${netErr.message}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`SDK service error (${response.status}): ${errorText}`);
     }
 
-    // Get container IP on the worker's network
-    const info = await container.inspect();
-    const networks = info.NetworkSettings.Networks;
-    const containerIp = networks[workerNetwork]?.IPAddress
-      || networks[Object.keys(networks)[0]]?.IPAddress
-      || '172.17.0.2';
-    console.log(`✅ Container started: ${info.Id.slice(0, 12)} (IP: ${containerIp} on ${workerNetwork})`);
-    collector.add(`Container IP: ${containerIp} (${workerNetwork})`);
+    const result = await response.json();
 
-    // Stream logs in background
-    const logStream = await container.logs({ follow: true, stdout: true, stderr: true });
-    logStream.on('data', (chunk) => {
-      const lines = chunk.toString('utf-8').split('\n').filter(Boolean);
-      lines.forEach((line) => collector.add(line));
-    });
+    // Parse result
+    const status = result.status === 'done' ? 'done' : 'error';
+    const exitCode = result.status === 'done' ? 0 : -1;
 
-    // Wait for OpenHands server to be ready
-    const ready = await waitForReady(containerIp, 90);
-    if (!ready) {
-      throw new Error('OpenHands server did not become ready within 90s');
+    collector.add(`Session: ${result.new_session ? 'NEW' : 'REUSED'} (task #${result.task_number})`);
+    collector.add(`Duration: ${result.duration}s`);
+
+    // Capture agent's text reply (the actual conversational response)
+    const agentReply = result.response || null;
+
+    // Append agent logs (for file debugging)
+    if (result.logs) {
+      result.logs.split('\n').forEach(line => collector.add(line));
     }
-    collector.add('OpenHands server ready');
 
-    // Submit task via REST API
-    const conversationId = await submitTask(containerIp, task);
-    if (!conversationId) {
-      throw new Error('Failed to submit task to OpenHands API');
+    if (result.error) {
+      collector.add(`Error: ${result.error}`);
     }
-    collector.add(`Conversation: ${conversationId}`);
 
-    // Poll for results
-    const result = await pollForResult(containerIp, conversationId, config.taskTimeout);
-    collector.add(`Result: ${result.status}`);
+    console.log(`📋 Task ${session_id}: ${status} (${result.duration}s, task #${result.task_number})`);
+    if (agentReply) console.log(`💬 Agent reply: ${agentReply.slice(0, 200)}`);
 
-    const status = ['done', 'completed', 'finished'].includes(result.status) ? 'done' : 'error';
-
-    // Save logs to file
+    // Save full logs to file (for debugging)
     saveLogsToFile(session_id, collector);
 
-    console.log(`📋 Task ${session_id}: ${status} (${collector.logs.length} log lines)`);
-    return { status, logs: collector.getSummary(status), exitCode: status === 'done' ? 0 : 1 };
+    // Return agentReply separately — index.js will send only this to Telegram
+    return { status, logs: collector.getSummary(status), exitCode, agentReply };
 
   } catch (err) {
     collector.add(`Error: ${err.message}`);
@@ -279,17 +89,34 @@ export async function executeTask(taskData) {
     saveLogsToFile(session_id, collector);
 
     return { status: 'error', logs: collector.getSummary('error'), exitCode: -1 };
-
-  } finally {
-    // Always clean up the container
-    if (container) {
-      try {
-        await container.stop({ t: 10 });
-        await container.remove({ force: true });
-        console.log(`🧹 Container ${containerName} cleaned up`);
-      } catch { /* may already be gone */ }
-    }
   }
+}
+
+/**
+ * Wait for SDK service to be ready (health check).
+ */
+async function waitForSdkService(collector) {
+  const MAX_WAIT = 60; // seconds
+  const startTime = Date.now();
+
+  while ((Date.now() - startTime) < MAX_WAIT * 1000) {
+    try {
+      const response = await fetch(`${SDK_SERVICE_URL}/health`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (response.ok) {
+        const health = await response.json();
+        collector.add(`SDK service ready (${health.active_sessions} active sessions)`);
+        console.log(`✅ SDK service ready`);
+        return;
+      }
+    } catch {
+      // Service not ready yet
+    }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  throw new Error(`SDK service not ready after ${MAX_WAIT}s`);
 }
 
 /**

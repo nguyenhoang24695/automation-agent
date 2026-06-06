@@ -39,6 +39,26 @@ services:
       timeout: 3s
       retries: 5
 
+  sdk-service:
+    build: ./sdk-service
+    env_file:
+      - .env
+    environment:
+      - LLM_MODEL=${NINEROUTER_MODEL:-kr/minimax-m2.5}
+      - LLM_API_KEY=${NINEROUTER_API_KEY}
+      - LLM_BASE_URL=http://9router:20128/v1
+      - WORKSPACE_BASE=/workspaces
+      - TASK_TIMEOUT=${TASK_TIMEOUT:-600}
+      - RUNTIME=local
+    depends_on:
+      9router:
+        condition: service_started
+    restart: unless-stopped
+    volumes:
+      - ./workspaces:/workspaces   # Shared workspace (files persist to host)
+      - ./:/project                 # Project source code accessible to agent
+      - ./logs:/app/logs
+
   worker:
     build: ./workers
     env_file:
@@ -46,14 +66,14 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - WORKSPACE_BASE=/workspaces
-      - NINEROUTER_BASE_URL=http://9router:20128
+      - SDK_SERVICE_URL=http://sdk-service:8080
+      - NINEROUTER_URL=http://9router:20128
     depends_on:
       redis:
         condition: service_healthy
-      9router:
+      sdk-service:
         condition: service_started
     restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # Docker API access
-      - ./workspaces:/workspaces                     # Task workspaces
-      - ./logs:/app/logs                             # Log files persist here
+      - ./workspaces:/workspaces   # Task workspaces (shared with sdk-service)
+      - ./logs:/app/logs           # Log files persist here

@@ -1,0 +1,7 @@
+# Core SDK (installed via uv in Dockerfile for better dependency resolution)
+openhands
+openhands-tools
+
+# Web framework
+fastapi
+uvicorn[standard]

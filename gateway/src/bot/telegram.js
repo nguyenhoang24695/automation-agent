@@ -50,7 +50,7 @@ bot.on('text', async (ctx) => {
   }
 
   const taskText = ctx.message.text;
-  const sessionId = `session_${ctx.from.id}_${ctx.message.message_id}`;
+  const sessionId = `session_${ctx.chat.id}`;
 
   await enqueueTask(sessionId, taskText, ctx.chat.id);
   await ctx.reply(

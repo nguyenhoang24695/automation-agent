@@ -44,9 +44,10 @@ async function runWorker() {
       // Execute the task
       const execResult = await executeTask(taskData);
 
-      // Notify user: task finished with formatted logs
+      // Notify user: send only agent's reply if available, otherwise full logs
       if (taskData.chat_id) {
-        await sendTelegramMessage(taskData.chat_id, execResult.logs);
+        const message = execResult.agentReply || execResult.logs;
+        await sendTelegramMessage(taskData.chat_id, message);
       }
 
     } catch (err) {

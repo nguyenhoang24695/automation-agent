@@ -1,68 +1,151 @@
-# Step 3: Run OpenHands from Docker (Node.js Worker)
+# Step 3: OpenHands SDK Integration (Persistent SDK Service + 9Router)
 
 ## Mục tiêu
 
-Tích hợp OpenHands — AI coding agent tự động thực thi task trong Docker sandbox. Worker viết bằng Node.js, dùng `dockerode` để quản lý container.
+Tích hợp OpenHands SDK qua **Persistent SDK Service** — một Python FastAPI service chạy dài hạn, duy trì Conversation objects per session. Worker (Node.js) gọi SDK service qua HTTP, không cần tạo container mỗi lần chạy task.
 
 ---
 
 ## Kiến trúc
 
 ```text
-Redis Queue (task_queue)
-    ↓ BLPOP
-Worker (Node.js + dockerode)
-    ↓ createContainer + start
-OpenHands Container
-    ↓ executes task
-/workspace (isolated)
-    ↓ complete
-Worker sends logs → Telegram Bot API
+Telegram → Gateway → Redis (task_queue)
+                          ↓ BLPOP
+                    Worker (Node.js)
+                          ↓ HTTP POST /task
+                    SDK Service (Python FastAPI — chạy dài hạn)
+                          ↓ Conversation.send_message() + run()
+                    OpenHands SDK → 9Router:20128/v1 (LLM via LiteLLM)
+                          ↓ Tools: Terminal, FileEditor, TaskTracker
+                    /workspaces/<session_id>/ (files persist to host)
+                          ↓ Response
+                    Worker captures logs → sends to Telegram
 ```
+
+### Tại sao dùng Persistent SDK Service?
+
+| Approach | Vấn đề | Kết luận |
+|----------|--------|----------|
+| REST API (agent-server) | Auth phức tạp, `AssertionError` trong `auth_user_context.py` | ❌ Không phù hợp |
+| CLI headless mode | Cần `settings.json` pre-configured, format thay đổi | ❌ Khó automate |
+| Docker-in-Docker (cũ) | Mỗi task tạo container mới, 30-60s overhead, không giữ context | ❌ Chậm, tốn token |
+| **Persistent SDK Service** | SDK pre-installed, session reuse, context retention | ✅ **Working** |
+
+### Lợi ích
+
+| Metric | DinD (cũ) | Persistent SDK (mới) |
+|--------|-----------|---------------------|
+| Task #1 (cold start) | 60-90s | ~28s |
+| Task #2+ (reused session) | 60-90s | **~10s** |
+| Token usage | Không có context | Full conversation context |
+| Docker socket | Required | **Not needed** |
+| Complexity | Docker API + network.connect() | Simple HTTP POST |
 
 ---
 
-## 1. Cấu trúc thư mục Worker
+## 1. Cấu trúc thư mục
 
 ```text
-workers/
-├── Dockerfile
-├── .dockerignore
-├── package.json
-└── src/
-    ├── index.js          # Main loop: poll Redis, dispatch tasks
-    ├── config.js          # Environment config
-    ├── worker.js          # Task executor: spawn container, wait, capture logs
-    └── notifier.js        # Send results back to Telegram
+├── sdk-service/
+│   ├── Dockerfile          # Python 3.12-slim + SDK pre-installed
+│   ├── app.py              # FastAPI session manager (264 lines)
+│   ├── requirements.txt    # Dependencies
+│   └── .dockerignore
+├── workers/
+│   ├── Dockerfile          # Node.js 20-alpine (no Docker socket)
+│   ├── package.json        # ioredis + dotenv (no dockerode)
+│   └── src/
+│       ├── index.js        # Main loop: poll Redis, dispatch tasks
+│       ├── config.js       # Environment config
+│       ├── worker.js       # HTTP client to SDK service
+│       ├── log-collector.js
+│       └── notifier.js     # Telegram notifications
 ```
 
 ---
 
-## 2. Dependencies
+## 2. SDK Service
 
-**package.json:**
+### Dockerfile
 
-```json
-{
-  "name": "ai-agent-worker",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "start": "node src/index.js"
-  },
-  "dependencies": {
-    "dockerode": "^4.0.4",
-    "ioredis": "^5.4.2",
-    "dotenv": "^16.4.7"
-  }
-}
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system deps (git for agent terminal, jq, curl)
+RUN apt-get update -qq && \
+    apt-get install -y -qq git curl jq > /dev/null 2>&1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager)
+RUN pip install uv -q
+
+# Pre-install OpenHands SDK (baked into image — no install at runtime)
+RUN uv pip install --system openhands openhands-tools fastapi uvicorn[standard]
+
+# Copy app
+COPY app.py ./app.py
+
+EXPOSE 8080
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
 ```
+
+### app.py — FastAPI Session Manager
+
+Key components:
+
+**Session storage:**
+```python
+sessions = {}  # session_id → {conversation, lock, log_buffer, created_at, ...}
+sessions_lock = threading.Lock()
+```
+
+**Session creation (first task):**
+```python
+def get_or_create_session(session_id, workspace_path=None):
+    from openhands.sdk import LLM, Agent, Conversation, Tool
+    from openhands.tools.file_editor import FileEditorTool
+    from openhands.tools.task_tracker import TaskTrackerTool
+    from openhands.tools.terminal import TerminalTool
+
+    llm = LLM(
+        model=f"openai/{LLM_MODEL}",   # openai/kr/claude-sonnet-4.5
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,          # http://9router:20128/v1
+    )
+
+    agent = Agent(llm=llm, tools=[
+        Tool(name=TerminalTool.name),
+        Tool(name=FileEditorTool.name),
+        Tool(name=TaskTrackerTool.name),
+    ])
+
+    conversation = Conversation(agent=agent, workspace=ws_dir)
+    # Store in sessions dict...
+```
+
+**Endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/task` | POST | Execute a task in a session (creates session if new) |
+| `/session/{id}` | DELETE | Remove session from memory |
+| `/sessions` | GET | List active sessions with stats |
+| `/health` | GET | Health check (used by worker wait loop) |
+
+**Task execution flow:**
+1. `POST /task` with `{session_id, task, workspace}`
+2. Get or create session (SDK init ~2-3s on first call)
+3. Run `conversation.send_message()` + `conversation.run()` in thread
+4. Return status, logs, duration, task_number
 
 ---
 
-## 3. Config
+## 3. Worker
 
-**src/config.js:**
+### config.js
 
 ```javascript
 import 'dotenv/config';
@@ -70,307 +153,54 @@ import 'dotenv/config';
 export const config = {
   redisUrl: process.env.REDIS_URL || 'redis://redis:6379/0',
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
-  openhandsImage: process.env.OPENHANDS_IMAGE || 'docker.all-hands.dev/all-hands-ai/openhands:latest',
+  sdkServiceUrl: process.env.SDK_SERVICE_URL || 'http://sdk-service:8080',
+  ninerouterUrl: process.env.NINEROUTER_URL || 'http://9router:20128',
+  ninerouterApiKey: process.env.NINEROUTER_API_KEY || '',
+  ninerouterModel: process.env.NINEROUTER_MODEL || 'kr/claude-sonnet-4.5',
   workspaceBase: process.env.WORKSPACE_BASE || '/workspaces',
-  taskTimeout: parseInt(process.env.TASK_TIMEOUT || '600', 10), // seconds
-  memLimit: parseInt(process.env.MEM_LIMIT || '2147483648', 10), // 2GB in bytes
-  cpuLimit: parseInt(process.env.CPU_LIMIT || '1', 10), // number of CPUs
+  taskTimeout: parseInt(process.env.TASK_TIMEOUT || '600', 10),
 };
-
-if (!config.telegramBotToken) {
-  console.error('❌ TELEGRAM_BOT_TOKEN is required');
-  process.exit(1);
-}
-
-console.log(`✅ Worker config loaded — timeout: ${config.taskTimeout}s, mem: ${Math.round(config.memLimit / 1073741824)}GB`);
 ```
 
----
-
-## 4. Telegram Notifier
-
-**src/notifier.js:**
-
-Sends results back to Telegram using the Bot API directly (no Telegraf needed):
+### worker.js — HTTP Client
 
 ```javascript
-import { config } from './config.js';
-
-const API_BASE = `https://api.telegram.org/bot${config.telegramBotToken}`;
-
-/**
- * Send a message to a Telegram chat.
- * Splits long messages to stay within Telegram's 4096 char limit.
- *
- * @param {number|string} chatId
- * @param {string} text
- */
-export async function sendTelegramMessage(chatId, text) {
-  const MAX_LEN = 4096;
-  const chunks = [];
-
-  for (let i = 0; i < text.length; i += MAX_LEN) {
-    chunks.push(text.slice(i, i + MAX_LEN));
-  }
-
-  for (const chunk of chunks) {
-    try {
-      await fetch(`${API_BASE}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk,
-          parse_mode: 'Markdown',
-        }),
-      });
-    } catch (err) {
-      console.error(`❌ Failed to send Telegram message to ${chatId}:`, err.message);
-    }
-  }
-}
-```
-
----
-
-## 5. Worker — Task Executor
-
-**src/worker.js:**
-
-```javascript
-import Docker from 'dockerode';
-import fs from 'node:fs';
-import path from 'node:path';
-import { config } from './config.js';
-
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
-
-/**
- * Execute a task by spawning an OpenHands container.
- *
- * @param {{session_id: string, task: string, chat_id: number|string, source?: string}} taskData
- * @returns {{status: string, logs: string}}
- */
 export async function executeTask(taskData) {
-  const { session_id, task, chat_id, source } = taskData;
+  const { session_id, task } = taskData;
   const workspacePath = path.join(config.workspaceBase, session_id);
-  const containerName = `openhands-${session_id}`;
 
-  console.log(`\n🚀 Starting task: ${session_id}`);
-  console.log(`   Task: ${task.slice(0, 100)}${task.length > 100 ? '...' : ''}`);
-
-  // Create workspace directory
   fs.mkdirSync(workspacePath, { recursive: true });
 
-  try {
-    // Pull image if not available
-    try {
-      await docker.getImage(config.openhandsImage).inspect();
-    } catch {
-      console.log(`📦 Pulling OpenHands image (first time)...`);
-      await new Promise((resolve, reject) => {
-        docker.pull(config.openhandsImage, (err, stream) => {
-          if (err) return reject(err);
-          docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
-        });
-      });
-      console.log('✅ Image pulled');
-    }
+  // Wait for SDK service health check
+  await waitForSdkService(collector);
 
-    // Spawn OpenHands container
-    const container = await docker.createContainer({
-      Image: config.openhandsImage,
-      name: containerName,
-      Env: [
-        `SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.openhandsImage}`,
-      ],
-      HostConfig: {
-        Binds: [`${workspacePath}:/workspace:rw`],
-        NetworkMode: 'bridge',
-        Memory: config.memLimit,
-        NanoCpus: config.cpuLimit * 1e9,
-        AutoRemove: true,
-      },
-      Cmd: ['python', '-m', 'openhands.core.main', '-t', task],
-    });
+  // Send task via HTTP
+  const response = await fetch(`${SDK_SERVICE_URL}/task`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id,
+      task,
+      workspace: workspacePath,
+    }),
+    signal: AbortSignal.timeout(config.taskTimeout * 1000),
+  });
 
-    await container.start();
-    const info = await container.inspect();
-    console.log(`✅ Container started: ${info.Id.slice(0, 12)}`);
-
-    // Wait for container to finish (with timeout)
-    const waitResult = await container.wait(config.taskTimeout);
-    const statusCode = waitResult.StatusCode;
-
-    // Capture logs
-    let logs = '';
-    try {
-      const logBuffer = await container.logs({ stdout: true, stderr: true });
-      logs = logBuffer.toString('utf-8');
-    } catch {
-      logs = '(unable to capture logs)';
-    }
-
-    const status = statusCode === 0 ? 'done' : 'error';
-    console.log(`📋 Task ${session_id} finished — status: ${status}, exit: ${statusCode}`);
-
-    return { status, logs, exitCode: statusCode };
-
-  } catch (err) {
-    console.error(`❌ Task ${session_id} failed:`, err.message);
-
-    // Try to clean up container on error
-    try {
-      const container = docker.getContainer(containerName);
-      await container.kill();
-      await container.remove({ force: true });
-    } catch { /* container may already be gone */ }
-
-    return { status: 'error', logs: err.message, exitCode: -1 };
-  }
+  const result = await response.json();
+  // result: { status, new_session, task_number, duration, logs, error? }
 }
 ```
 
----
-
-## 6. Main Entry Point
-
-**src/index.js:**
-
-```javascript
-import Redis from 'ioredis';
-import { config } from './config.js';
-import { executeTask } from './worker.js';
-import { sendTelegramMessage } from './notifier.js';
-
-const redis = new Redis(config.redisUrl, {
-  maxRetriesPerRequest: 3,
-  retryStrategy(times) {
-    return Math.min(times * 200, 5000);
-  },
-});
-
-redis.on('connect', () => console.log('✅ Worker Redis connected'));
-redis.on('error', (err) => console.error('❌ Redis error:', err.message));
-
-const TASK_QUEUE = 'task_queue';
-const POLL_TIMEOUT = 5; // seconds for BLPOP
-
-/**
- * Format task result into a Telegram-friendly message.
- */
-function formatResult(taskData, result) {
-  const { session_id } = taskData;
-  const statusIcon = result.status === 'done' ? '✅' : '❌';
-  const logPreview = result.logs.slice(0, 2000);
-
-  return [
-    `${statusIcon} *Task ${result.status === 'done' ? 'completed' : 'failed'}*`,
-    '',
-    `Session: \`${session_id}\``,
-    `Exit code: ${result.exitCode}`,
-    '',
-    '*Logs:*',
-    '```',
-    logPreview,
-    '```',
-    result.logs.length > 2000 ? '\n_(logs truncated — full logs in workspace)_' : '',
-  ].join('\n');
-}
-
-/**
- * Main worker loop: BLPOP from Redis, execute, notify.
- */
-async function runWorker() {
-  console.log('🔄 Worker started, waiting for tasks...');
-
-  while (true) {
-    try {
-      // BLPOP blocks until a task is available (or timeout)
-      const result = await redis.blpop(TASK_QUEUE, POLL_TIMEOUT);
-      if (!result) continue; // timeout, try again
-
-      const [, raw] = result;
-      const taskData = JSON.parse(raw);
-
-      console.log(`\n📨 Dequeued: ${taskData.session_id}`);
-
-      // Notify user: task started
-      if (taskData.chat_id) {
-        await sendTelegramMessage(
-          taskData.chat_id,
-          `⏳ *Processing task...*\nSession: \`${taskData.session_id}\``
-        );
-      }
-
-      // Execute the task
-      const execResult = await executeTask(taskData);
-
-      // Notify user: task finished
-      if (taskData.chat_id) {
-        const message = formatResult(taskData, execResult);
-        await sendTelegramMessage(taskData.chat_id, message);
-      }
-
-    } catch (err) {
-      console.error('❌ Worker loop error:', err.message);
-      // Brief pause before retry on error
-      await new Promise(r => setTimeout(r, 2000));
-    }
-  }
-}
-
-// Graceful shutdown
-process.once('SIGINT', () => {
-  console.log('\n⏹ Worker shutting down...');
-  redis.disconnect();
-  process.exit(0);
-});
-
-process.once('SIGTERM', () => {
-  console.log('\n⏹ Worker shutting down...');
-  redis.disconnect();
-  process.exit(0);
-});
-
-runWorker();
-```
+**No more:**
+- `dockerode` dependency
+- Docker socket mount
+- `network.connect()` calls
+- Container lifecycle management
+- Image pulling logic
 
 ---
 
-## 7. Worker Dockerfile
-
-**Dockerfile:**
-
-```dockerfile
-FROM node:20-alpine
-
-WORKDIR /app
-
-# Install dependencies
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
-
-# Copy source
-COPY src/ ./src/
-
-CMD ["node", "src/index.js"]
-```
-
-**.dockerignore:**
-
-```text
-node_modules
-npm-debug.log
-```
-
-> **Note:** The worker image is lightweight — no Docker CLI needed. It uses the Docker API via the mounted socket.
-
----
-
-## 8. Cập nhật Docker Compose
-
-Thêm worker vào **docker-compose.yml:**
+## 4. Docker Compose
 
 ```yaml
 services:
@@ -378,137 +208,211 @@ services:
     build: ./gateway
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
-    env_file:
-      - .env
+    env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - NODE_ENV=production
     depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+      redis: { condition: service_healthy }
     volumes:
       - ./logs:/app/logs
       - ./secrets:/app/secrets
+
+  9router:
+    image: decolua/9router:latest
+    ports:
+      - "${NINEROUTER_PORT:-20128}:20128"
+    volumes:
+      - ./9router-data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+      - PORT=20128
+      - HOSTNAME=0.0.0.0
 
   redis:
     image: redis:7-alpine
     volumes:
       - ./redis/data:/data
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+  sdk-service:
+    build: ./sdk-service
+    env_file: .env
+    environment:
+      - LLM_MODEL=${NINEROUTER_MODEL:-kr/claude-sonnet-4.5}
+      - LLM_API_KEY=${NINEROUTER_API_KEY}
+      - LLM_BASE_URL=http://9router:20128/v1
+      - WORKSPACE_BASE=/workspaces
+      - TASK_TIMEOUT=${TASK_TIMEOUT:-600}
+      - RUNTIME=local
+    depends_on:
+      9router: { condition: service_started }
+    volumes:
+      - ./workspaces:/workspaces    # Files persist to host
+      - ./logs:/app/logs
+
   worker:
     build: ./workers
-    env_file:
-      - .env
+    env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
       - WORKSPACE_BASE=/workspaces
+      - SDK_SERVICE_URL=http://sdk-service:8080
+      - NINEROUTER_URL=http://9router:20128
     depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+      redis: { condition: service_healthy }
+      sdk-service: { condition: service_started }
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # Docker API access
-      - ./workspaces:/workspaces                     # Task workspaces
+      - ./workspaces:/workspaces
       - ./logs:/app/logs
 ```
 
-> ⚠️ **Lưu ý bảo mật**: Worker cần Docker socket (`/var/run/docker.sock`) để spawn container con. Đây là trade-off cần thiết cho MVP. Trong production, nên dùng Docker-in-Docker (DinD) hoặc remote Docker host.
+**Key points:**
+- `sdk-service` and `worker` share `./workspaces:/workspaces` volume
+- No Docker socket mount anywhere
+- All services on same docker-compose network (no `network.connect()` needed)
+- `RUNTIME=local` tells SDK to run tools directly (no sandbox container)
 
 ---
 
-## 9. Security: Workspace Isolation
+## 5. Environment Variables
 
-Mỗi task chạy trong workspace riêng:
+| Variable | Default | Used By | Description |
+|----------|---------|---------|-------------|
+| `REDIS_URL` | `redis://redis:6379/0` | Worker | Redis connection |
+| `TELEGRAM_BOT_TOKEN` | (required) | Worker | Telegram Bot API token |
+| `SDK_SERVICE_URL` | `http://sdk-service:8080` | Worker | SDK service URL |
+| `NINEROUTER_URL` | `http://9router:20128` | Worker | 9Router base URL |
+| `NINEROUTER_API_KEY` | (required) | SDK Service | 9Router API key |
+| `NINEROUTER_MODEL` | `kr/claude-sonnet-4.5` | SDK Service | LLM model name |
+| `LLM_BASE_URL` | `http://9router:20128/v1` | SDK Service | Full API URL |
+| `WORKSPACE_BASE` | `/workspaces` | Both | Workspace base path |
+| `TASK_TIMEOUT` | `600` | Both | Max seconds per task |
 
-```text
-/opt/ai-agent/workspaces/
-├── session_123456789_100/
-├── session_123456789_101/
-└── zalo_userABC_1717500000000/
+---
+
+## 6. Network Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│           Docker Compose Network                         │
+│                                                          │
+│  Gateway ──→ Redis (task_queue LPUSH)                    │
+│                                                          │
+│  Worker ──→ Redis (BLPOP)                                │
+│     │                                                    │
+│     ├──→ SDK Service (HTTP POST /task)                   │
+│     │                                                    │
+│  SDK Service ──→ 9Router:20128/v1 (LLM via LiteLLM)     │
+│     │              │                                     │
+│     │              ↓                                     │
+│     │         LLM Providers (internet)                   │
+│     │                                                    │
+│     └──→ /workspaces/<session_id>/ (bind mount → host)   │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Rules:
-- **KHÔNG** mount `/`, `/home`, `/root`
-- **KHÔNG** mount Docker socket vào OpenHands container
-- Mỗi container bị giới hạn **2GB RAM**, **1 CPU**
-- Timeout **10 phút** mỗi task (configurable via `TASK_TIMEOUT`)
-- Container auto-remove sau khi hoàn thành
+All services communicate via Docker Compose's default network. No explicit network connect needed.
 
 ---
 
-## 10. Environment Variables (Worker-specific)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WORKSPACE_BASE` | `/workspaces` | Base path for task workspaces |
-| `TASK_TIMEOUT` | `600` | Max seconds per task |
-| `MEM_LIMIT` | `2147483648` | RAM limit in bytes (2GB) |
-| `CPU_LIMIT` | `1` | Number of CPUs |
-| `OPENHANDS_IMAGE` | `docker.all-hands.dev/.../openhands:latest` | OpenHands Docker image |
-
----
-
-## 11. Build & Run
+## 7. Build & Run
 
 ```bash
-cd /opt/ai-agent
+cd /home/ubuntu/automation-agent
 docker compose up --build -d
-```
 
----
-
-## 12. Kiểm tra
-
-```bash
-# Xem logs worker
-docker compose logs -f worker
-
-# Xem logs gateway + worker cùng lúc
-docker compose logs -f gateway worker
-
-# Gửi task qua Telegram: "Create a hello world HTML page"
-# → Worker dequeue từ Redis
-# → Spawn OpenHands container
-# → Container thực thi task
-# → Worker gửi kết quả về Telegram
-
-# Kiểm tra workspace
-ls -la ./workspaces/
-
-# Kiểm tra tất cả containers
+# Check status
 docker compose ps
+
+# View logs
+docker compose logs -f sdk-service worker
+
+# Test (push task directly to Redis)
+docker compose exec redis redis-cli LPUSH task_queue \
+  '{"session_id":"test_001","task":"Create hello.txt with Hello World","chat_id":0}'
+```
+
+Or from local machine:
+```bash
+node scripts/deploy.js          # Full deploy
+node scripts/deploy.js worker   # Worker only
+node scripts/deploy.js sdk      # SDK service only
+node scripts/test-worker.js     # Test with monitoring
 ```
 
 ---
 
-## 13. Troubleshooting
+## 8. Session Lifecycle
+
+```
+Task 1 (session_id=abc):
+  → SDK service creates Conversation object (~2-3s)
+  → send_message() + run() (~25s)
+  → Total: ~28s
+  → Session kept in memory
+
+Task 2 (session_id=abc):
+  → SDK service REUSES existing Conversation (~0s)
+  → Agent has full context from Task 1
+  → send_message() + run() (~10s)
+  → Total: ~10s
+  → Token savings from context reuse
+
+Cleanup:
+  → DELETE /session/abc removes from memory
+  → Workspace files remain on host unless delete_workspace=true
+```
+
+---
+
+## 9. Troubleshooting
 
 | Vấn đề | Nguyên nhân | Cách xử lý |
 |---------|-------------|------------|
-| Worker không spawn container | Docker socket permission | Kiểm tra volume mount `/var/run/docker.sock` |
-| Container timeout | Task quá phức tạp | Tăng `TASK_TIMEOUT` hoặc chia nhỏ task |
-| Out of memory | Container vượt 2GB | Tăng `MEM_LIMIT` trong .env |
-| Image pull failed | Network issue | `docker pull docker.all-hands.dev/all-hands-ai/openhands:latest` thủ công |
-| Workspace không tạo | Permission denied | `chown -R ubuntu:ubuntu ./workspaces` |
-| Logs không gửi về Telegram | Bot token sai | Kiểm tra `TELEGRAM_BOT_TOKEN` trong .env |
+| `SDK service not ready after 60s` | SDK service chưa khởi động xong | Check `docker compose logs sdk-service` |
+| `BadRequestError: LLM Provider NOT provided` | Thiếu `openai/` prefix | SDK tự động thêm: `openai/{LLM_MODEL}` |
+| `Connection refused` đến sdk-service | Service crash hoặc chưa start | `docker compose restart sdk-service` |
+| Files not appearing on host | Workspace mount sai | Check `./workspaces:/workspaces` in docker-compose |
+| Session busy (409) | Task trước chưa xong | Wait hoặc increase timeout |
+| High memory usage | Nhiều sessions tích lũy | Periodically cleanup old sessions |
+| Worker không dequeue | Redis connection error | Check `REDIS_URL` và Redis health |
+
+---
+
+## 10. Monitoring
+
+```bash
+# SDK service health
+curl http://localhost:8080/health
+
+# Active sessions
+curl http://localhost:8080/sessions
+
+# Worker logs
+docker compose logs -f worker
+
+# SDK service logs
+docker compose logs -f sdk-service
+```
 
 ---
 
 ## Kết quả Step 3
 
-- [x] Worker (Node.js) lắng nghe task từ Redis queue (BLPOP)
-- [x] OpenHands container spawn tự động qua Docker API (dockerode)
-- [x] Workspace isolation theo session_id
-- [x] Resource limits (RAM, CPU, timeout)
-- [x] Kết quả gửi về Telegram qua Bot API
-- [x] Graceful shutdown (SIGINT/SIGTERM)
+- [x] Persistent SDK Service (Python FastAPI) — always running
+- [x] Worker calls SDK service via HTTP (no Docker-in-Docker)
+- [x] Conversation context retention across tasks
+- [x] LLM calls via 9Router (OpenAI-compatible API)
+- [x] Agent tools: Terminal, FileEditor, TaskTracker
+- [x] Workspace isolation per session_id
+- [x] File persistence to host filesystem
+- [x] Task timeout handling (threading)
+- [x] No Docker socket required
+- [x] ~10s response for reused sessions (vs 60-90s with DinD)
 
 ---
 
