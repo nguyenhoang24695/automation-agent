@@ -89,7 +89,7 @@ async function submitTask(containerIp, task) {
           content: [{ type: 'text', text: task }],
         },
       }),
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(120000),
     });
 
     if (!resp.ok) {
@@ -179,8 +179,8 @@ export async function executeTask(taskData) {
         `AGENT_SERVER_IMAGE_TAG=${config.agentServerTag}`,
         'LOG_ALL_EVENTS=true',
         `SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.agentServerRepo}:${config.agentServerTag}`,
-        // LLM configuration via 9Router
-        `LLM_API_URL=${config.ninerouterUrl}/v1`,
+        // LLM configuration via 9Router (OpenHands uses LiteLLM — expects LLM_BASE_URL)
+        `LLM_BASE_URL=${config.ninerouterUrl}/v1`,
         `LLM_API_KEY=${config.ninerouterApiKey}`,
         `LLM_MODEL=${config.ninerouterModel}`,
       ],
