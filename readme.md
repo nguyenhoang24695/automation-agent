@@ -44,7 +44,7 @@ Claude / Gemini / Qwen
 | Redis             | Task queue           |
 | OpenHands         | AI coding agent      |
 | Docker            | Sandbox isolation    |
-| 9Router           | LLM routing/fallback |
+| **9Router**       | **LLM routing + fallback (FREE)** |
 | Cloudflare Tunnel | Public preview URLs  |
 
 ---
@@ -246,6 +246,8 @@ Suggested routing:
 | simple tasks        | Gemini Flash  |
 | hard coding         | Claude Sonnet |
 | difficult debugging | Claude Opus   |
+
+9Router setup prompt: `docs/prompts/setup-9router.md`
 
 ---
 
