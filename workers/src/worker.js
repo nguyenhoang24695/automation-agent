@@ -27,23 +27,40 @@ async function getWorkerNetwork() {
 }
 
 /**
- * Pull the OpenHands image if not already available.
+ * Pull a Docker image if not already available.
  */
-async function ensureImage(collector) {
+async function pullImageIfMissing(imageName) {
   try {
-    await docker.getImage(config.openhandsImage).inspect();
+    await docker.getImage(imageName).inspect();
+    console.log(`📦 Image already available: ${imageName}`);
+    return true;
   } catch {
-    collector.add('Pulling OpenHands image (this may take a few minutes)...');
-    console.log(`📦 Pulling OpenHands image: ${config.openhandsImage}`);
+    console.log(`📦 Pulling image (this may take a few minutes): ${imageName}`);
     await new Promise((resolve, reject) => {
-      docker.pull(config.openhandsImage, (err, stream) => {
+      docker.pull(imageName, (err, stream) => {
         if (err) return reject(err);
         docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
       });
     });
-    collector.add('Image pulled successfully');
-    console.log('✅ Image pulled');
+    console.log(`✅ Image pulled: ${imageName}`);
+    return true;
   }
+}
+
+/**
+ * Ensure both OpenHands and agent-server images are available.
+ */
+async function ensureImages(collector) {
+  // OpenHands main image
+  collector.add('Checking OpenHands image...');
+  await pullImageIfMissing(config.openhandsImage);
+  collector.add(`OpenHands image OK: ${config.openhandsImage}`);
+
+  // Agent-server image (pulled by OpenHands on first conversation — pre-pull to avoid timeout)
+  const agentServerImage = `${config.agentServerRepo}:${config.agentServerTag}`;
+  collector.add('Checking agent-server image...');
+  await pullImageIfMissing(agentServerImage);
+  collector.add(`Agent-server image OK: ${agentServerImage}`);
 }
 
 /**
@@ -89,7 +106,7 @@ async function submitTask(containerIp, task) {
           content: [{ type: 'text', text: task }],
         },
       }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(300000),
     });
 
     if (!resp.ok) {
@@ -167,8 +184,8 @@ export async function executeTask(taskData) {
   let container = null;
 
   try {
-    // Ensure image is available
-    await ensureImage(collector);
+    // Ensure both images are available
+    await ensureImages(collector);
 
     // Create OpenHands container (as a server)
     container = await docker.createContainer({
