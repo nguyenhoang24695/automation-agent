@@ -7,6 +7,26 @@ import { LogCollector } from './log-collector.js';
 const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 
 /**
+ * Detect the Docker network this worker container is on.
+ * Falls back to 'bridge' if detection fails.
+ */
+async function getWorkerNetwork() {
+  try {
+    const hostname = (await fs.promises.readFile('/etc/hostname', 'utf-8')).trim();
+    const workerContainer = docker.getContainer(hostname);
+    const info = await workerContainer.inspect();
+    const networkNames = Object.keys(info.NetworkSettings.Networks);
+    if (networkNames.length > 0) {
+      console.log(`🌐 Worker network: ${networkNames[0]}`);
+      return networkNames[0];
+    }
+  } catch (err) {
+    console.log(`⚠️ Network detection failed: ${err.message}, using bridge`);
+  }
+  return 'bridge';
+}
+
+/**
  * Pull the OpenHands image if not already available.
  */
 async function ensureImage(collector) {
@@ -180,13 +200,27 @@ export async function executeTask(taskData) {
     await container.start();
     collector.add(`Container started: ${containerName}`);
 
-    // Get container IP for API communication
+    // Connect OpenHands to worker's Docker network so they can communicate
+    const workerNetwork = await getWorkerNetwork();
+    const network = docker.getNetwork(workerNetwork);
+    try {
+      await network.connect({ Container: container.id });
+      collector.add(`Connected to network: ${workerNetwork}`);
+      console.log(`🌐 Connected OpenHands to network: ${workerNetwork}`);
+    } catch (netErr) {
+      // May already be on the network (e.g., bridge)
+      collector.add(`Network connect skipped: ${netErr.message}`);
+      console.log(`⚠️ Network connect: ${netErr.message}`);
+    }
+
+    // Get container IP on the worker's network
     const info = await container.inspect();
     const networks = info.NetworkSettings.Networks;
-    const networkName = Object.keys(networks)[0];
-    const containerIp = networks[networkName].IPAddress;
-    console.log(`✅ Container started: ${info.Id.slice(0, 12)} (IP: ${containerIp})`);
-    collector.add(`Container IP: ${containerIp}`);
+    const containerIp = networks[workerNetwork]?.IPAddress
+      || networks[Object.keys(networks)[0]]?.IPAddress
+      || '172.17.0.2';
+    console.log(`✅ Container started: ${info.Id.slice(0, 12)} (IP: ${containerIp} on ${workerNetwork})`);
+    collector.add(`Container IP: ${containerIp} (${workerNetwork})`);
 
     // Stream logs in background
     const logStream = await container.logs({ follow: true, stdout: true, stderr: true });
