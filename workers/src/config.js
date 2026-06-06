@@ -25,6 +25,11 @@ export const config = {
 
   // CPU limit (number of CPUs)
   cpuLimit: parseInt(process.env.CPU_LIMIT || '1', 10),
+
+  // 9Router (LLM Router) — OpenAI-compatible API
+  ninerouterUrl: process.env.NINEROUTER_BASE_URL || 'http://9router:20128',
+  ninerouterApiKey: process.env.NINEROUTER_API_KEY || '',
+  ninerouterModel: process.env.NINEROUTER_MODEL || 'kr/claude-sonnet-4.5',
 };
 
 // Validate required fields
@@ -33,4 +38,4 @@ if (!config.telegramBotToken) {
   process.exit(1);
 }
 
-console.log(`✅ Worker config loaded — timeout: ${config.taskTimeout}s, mem: ${Math.round(config.memLimit / 1073741824)}GB`);
+console.log(`✅ Worker config loaded — timeout: ${config.taskTimeout}s, mem: ${Math.round(config.memLimit / 1073741824)}GB, LLM: ${config.ninerouterUrl}`);

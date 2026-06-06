@@ -16,6 +16,18 @@ services:
       - ./logs:/app/logs
       - ./secrets:/app/secrets   # Zalo credentials persist here
 
+  9router:
+    image: decolua/9router:latest
+    ports:
+      - "${NINEROUTER_PORT:-20128}:20128"
+    volumes:
+      - ./9router-data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+      - PORT=20128
+      - HOSTNAME=0.0.0.0
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     volumes:
@@ -34,9 +46,12 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - WORKSPACE_BASE=/workspaces
+      - NINEROUTER_BASE_URL=http://9router:20128
     depends_on:
       redis:
         condition: service_healthy
+      9router:
+        condition: service_started
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # Docker API access
