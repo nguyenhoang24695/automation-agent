@@ -8,7 +8,11 @@ export const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
 
   // OpenHands Docker image
-  openhandsImage: process.env.OPENHANDS_IMAGE || 'docker.all-hands.dev/all-hands-ai/openhands:latest',
+  openhandsImage: process.env.OPENHANDS_IMAGE || 'docker.openhands.dev/openhands/openhands:1.7',
+
+  // OpenHands Agent Server image (used internally by OpenHands)
+  agentServerRepo: process.env.AGENT_SERVER_IMAGE_REPOSITORY || 'ghcr.io/openhands/agent-server',
+  agentServerTag: process.env.AGENT_SERVER_IMAGE_TAG || '1.19.1-python',
 
   // Workspace base path (where task files are created)
   workspaceBase: process.env.WORKSPACE_BASE || '/workspaces',

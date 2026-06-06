@@ -7,7 +7,124 @@ import { LogCollector } from './log-collector.js';
 const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 
 /**
- * Execute a task by spawning an OpenHands container with real-time log streaming.
+ * Pull the OpenHands image if not already available.
+ */
+async function ensureImage(collector) {
+  try {
+    await docker.getImage(config.openhandsImage).inspect();
+  } catch {
+    collector.add('Pulling OpenHands image (this may take a few minutes)...');
+    console.log(`📦 Pulling OpenHands image: ${config.openhandsImage}`);
+    await new Promise((resolve, reject) => {
+      docker.pull(config.openhandsImage, (err, stream) => {
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
+      });
+    });
+    collector.add('Image pulled successfully');
+    console.log('✅ Image pulled');
+  }
+}
+
+/**
+ * Wait for the OpenHands server to be ready on port 3000.
+ * @param {string} containerIp - Container IP on Docker bridge network
+ * @param {number} maxWait - Max seconds to wait
+ * @returns {boolean}
+ */
+async function waitForReady(containerIp, maxWait = 60) {
+  const url = `http://${containerIp}:3000/api/v1/health`;
+  console.log(`⏳ Waiting for OpenHands at ${url}...`);
+
+  for (let i = 0; i < maxWait; i++) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (resp.ok) {
+        console.log('✅ OpenHands server is ready');
+        return true;
+      }
+    } catch { /* not ready yet */ }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  console.log('⚠️ OpenHands server did not become ready in time');
+  return false;
+}
+
+/**
+ * Submit a task to OpenHands via REST API.
+ * @param {string} containerIp
+ * @param {string} task
+ * @returns {string|null} - app_conversation_id or null
+ */
+async function submitTask(containerIp, task) {
+  const url = `http://${containerIp}:3000/api/v1/app-conversations`;
+  console.log(`📤 Submitting task to OpenHands...`);
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        initial_message: {
+          content: [{ type: 'text', text: task }],
+        },
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!resp.ok) {
+      const error = await resp.text();
+      console.error(`❌ Submit failed (${resp.status}): ${error}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    const convId = data.app_conversation_id || data.conversation_id || data.id;
+    console.log(`✅ Task submitted — conversation: ${convId}`);
+    return convId;
+
+  } catch (err) {
+    console.error('❌ Submit error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Poll OpenHands API for task completion.
+ * @param {string} containerIp
+ * @param {string} conversationId
+ * @param {number} timeoutSec
+ * @returns {{status: string, events: object[]}}
+ */
+async function pollForResult(containerIp, conversationId, timeoutSec) {
+  const url = `http://${containerIp}:3000/api/v1/app-conversations/${conversationId}`;
+  const startTime = Date.now();
+
+  console.log(`⏳ Polling for results...`);
+
+  while ((Date.now() - startTime) < timeoutSec * 1000) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (resp.ok) {
+        const data = await resp.json();
+        const status = data.status || data.state || 'unknown';
+
+        // Check if task is complete
+        if (['done', 'completed', 'finished', 'error', 'failed', 'stopped'].includes(status)) {
+          console.log(`📋 Task finished with status: ${status}`);
+          return { status, data };
+        }
+      }
+    } catch { /* poll error, retry */ }
+
+    await new Promise(r => setTimeout(r, 5000));
+  }
+
+  return { status: 'timeout', data: null };
+}
+
+/**
+ * Execute a task by spawning an OpenHands server container.
  *
  * @param {{session_id: string, task: string, chat_id: number|string, source?: string}} taskData
  * @returns {{status: string, logs: string, exitCode: number}}
@@ -27,101 +144,101 @@ export async function executeTask(taskData) {
   // Create workspace directory
   fs.mkdirSync(workspacePath, { recursive: true });
 
-  try {
-    // Pull image if not already available
-    try {
-      await docker.getImage(config.openhandsImage).inspect();
-    } catch {
-      collector.add('Pulling OpenHands image...');
-      console.log('📦 Pulling OpenHands image (first time)...');
-      await new Promise((resolve, reject) => {
-        docker.pull(config.openhandsImage, (err, stream) => {
-          if (err) return reject(err);
-          docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve());
-        });
-      });
-      collector.add('Image pulled');
-      console.log('✅ Image pulled');
-    }
+  let container = null;
 
-    // Create OpenHands container
-    const container = await docker.createContainer({
+  try {
+    // Ensure image is available
+    await ensureImage(collector);
+
+    // Create OpenHands container (as a server)
+    container = await docker.createContainer({
       Image: config.openhandsImage,
       name: containerName,
       Env: [
-        `SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.openhandsImage}`,
+        `AGENT_SERVER_IMAGE_REPOSITORY=${config.agentServerRepo}`,
+        `AGENT_SERVER_IMAGE_TAG=${config.agentServerTag}`,
+        'LOG_ALL_EVENTS=true',
+        `SANDBOX_RUNTIME_CONTAINER_IMAGE=${config.agentServerRepo}:${config.agentServerTag}`,
       ],
+      ExposedPorts: { '3000/tcp': {} },
       HostConfig: {
-        Binds: [`${workspacePath}:/workspace:rw`],
-        NetworkMode: 'bridge',
+        Binds: [
+          `${workspacePath}:/opt/workspace_base:rw`,
+          '/var/run/docker.sock:/var/run/docker.sock',
+        ],
+        ExtraHosts: ['host.docker.internal:host-gateway'],
+        PortBindings: {}, // Don't bind to host — use Docker network IP
         Memory: config.memLimit,
         NanoCpus: config.cpuLimit * 1e9,
-        AutoRemove: true,
       },
-      Cmd: ['python', '-m', 'openhands.core.main', '-t', task],
     });
 
     await container.start();
     collector.add(`Container started: ${containerName}`);
 
+    // Get container IP for API communication
     const info = await container.inspect();
-    console.log(`✅ Container started: ${info.Id.slice(0, 12)}`);
+    const networks = info.NetworkSettings.Networks;
+    const networkName = Object.keys(networks)[0];
+    const containerIp = networks[networkName].IPAddress;
+    console.log(`✅ Container started: ${info.Id.slice(0, 12)} (IP: ${containerIp})`);
+    collector.add(`Container IP: ${containerIp}`);
 
-    // Stream logs in real-time
-    const logStream = await container.logs({
-      follow: true,
-      stdout: true,
-      stderr: true,
-    });
-
+    // Stream logs in background
+    const logStream = await container.logs({ follow: true, stdout: true, stderr: true });
     logStream.on('data', (chunk) => {
       const lines = chunk.toString('utf-8').split('\n').filter(Boolean);
       lines.forEach((line) => collector.add(line));
     });
 
-    // Wait for container to finish (with timeout)
-    const waitResult = await container.wait(config.taskTimeout);
-    const statusCode = waitResult.StatusCode;
+    // Wait for OpenHands server to be ready
+    const ready = await waitForReady(containerIp, 90);
+    if (!ready) {
+      throw new Error('OpenHands server did not become ready within 90s');
+    }
+    collector.add('OpenHands server ready');
 
-    // Final log capture (in case stream missed anything)
-    try {
-      const finalLogs = await container.logs({ stdout: true, stderr: true });
-      const finalText = finalLogs.toString('utf-8');
-      if (finalText && collector.logs.length <= 2) {
-        finalText.split('\n').filter(Boolean).forEach(l => collector.add(l));
-      }
-    } catch { /* container auto-removed */ }
+    // Submit task via REST API
+    const conversationId = await submitTask(containerIp, task);
+    if (!conversationId) {
+      throw new Error('Failed to submit task to OpenHands API');
+    }
+    collector.add(`Conversation: ${conversationId}`);
 
-    const status = statusCode === 0 ? 'done' : 'error';
+    // Poll for results
+    const result = await pollForResult(containerIp, conversationId, config.taskTimeout);
+    collector.add(`Result: ${result.status}`);
+
+    const status = ['done', 'completed', 'finished'].includes(result.status) ? 'done' : 'error';
 
     // Save logs to file
     saveLogsToFile(session_id, collector);
 
-    console.log(`📋 Task ${session_id}: ${status} (exit ${statusCode}, ${collector.logs.length} log lines)`);
-    return { status, logs: collector.getSummary(status), exitCode: statusCode };
+    console.log(`📋 Task ${session_id}: ${status} (${collector.logs.length} log lines)`);
+    return { status, logs: collector.getSummary(status), exitCode: status === 'done' ? 0 : 1 };
 
   } catch (err) {
     collector.add(`Error: ${err.message}`);
     console.error(`❌ Task ${session_id} failed:`, err.message);
 
-    // Save logs even on error
     saveLogsToFile(session_id, collector);
 
-    // Clean up container on error
-    try {
-      const container = docker.getContainer(containerName);
-      await container.kill();
-      await container.remove({ force: true });
-    } catch { /* container may already be gone */ }
-
     return { status: 'error', logs: collector.getSummary('error'), exitCode: -1 };
+
+  } finally {
+    // Always clean up the container
+    if (container) {
+      try {
+        await container.stop({ t: 10 });
+        await container.remove({ force: true });
+        console.log(`🧹 Container ${containerName} cleaned up`);
+      } catch { /* may already be gone */ }
+    }
   }
 }
 
 /**
  * Save collected logs to a file for debugging.
- * @param {string} sessionId
- * @param {LogCollector} collector
  */
 function saveLogsToFile(sessionId, collector) {
   try {
